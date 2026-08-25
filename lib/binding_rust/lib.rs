@@ -5,7 +5,10 @@
 pub mod ffi;
 mod util;
 
-#[cfg(not(feature = "std"))]
+#[cfg(any(
+    not(feature = "std"),
+    all(target_arch = "wasm32", target_os = "unknown")
+))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, format, string::String, string::ToString, vec::Vec};
@@ -35,6 +38,9 @@ mod wasm_language;
 #[cfg(feature = "wasm")]
 #[cfg_attr(docsrs, doc(cfg(feature = "wasm")))]
 pub use wasm_language::*;
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod wasm_allocator;
 
 /// The latest ABI version that is supported by the current version of the
 /// library.
@@ -276,9 +282,12 @@ impl<'a> QueryCursorOptions<'a> {
     }
 }
 
-struct QueryCursorOptionsDrop(*mut ffi::TSQueryCursorOptions);
+struct QueryCursorOptionsDrop<'options>(
+    *mut ffi::TSQueryCursorOptions,
+    PhantomData<QueryProgressCallback<'options>>,
+);
 
-impl Drop for QueryCursorOptionsDrop {
+impl Drop for QueryCursorOptionsDrop<'_> {
     fn drop(&mut self) {
         unsafe {
             if !(*self.0).payload.is_null() {
@@ -398,14 +407,14 @@ pub struct QueryMatch<'cursor, 'tree> {
 }
 
 /// A sequence of [`QueryMatch`]es associated with a given [`QueryCursor`].
-pub struct QueryMatches<'query, 'tree, T: TextProvider<I>, I: AsRef<[u8]>> {
+pub struct QueryMatches<'query, 'tree, 'options, T: TextProvider<I>, I: AsRef<[u8]>> {
     ptr: *mut ffi::TSQueryCursor,
     query: &'query Query,
     text_provider: T,
     buffer1: Vec<u8>,
     buffer2: Vec<u8>,
     current_match: Option<QueryMatch<'query, 'tree>>,
-    _options: Option<QueryCursorOptionsDrop>,
+    _options: Option<QueryCursorOptionsDrop<'options>>,
     _phantom: PhantomData<(&'tree (), I)>,
 }
 
@@ -413,14 +422,14 @@ pub struct QueryMatches<'query, 'tree, T: TextProvider<I>, I: AsRef<[u8]>> {
 ///
 /// During iteration, each element contains a [`QueryMatch`] and index. The index can
 /// be used to access the new capture inside of the [`QueryMatch::captures`]'s [`captures`].
-pub struct QueryCaptures<'query, 'tree, T: TextProvider<I>, I: AsRef<[u8]>> {
+pub struct QueryCaptures<'query, 'tree, 'options, T: TextProvider<I>, I: AsRef<[u8]>> {
     ptr: *mut ffi::TSQueryCursor,
     query: &'query Query,
     text_provider: T,
     buffer1: Vec<u8>,
     buffer2: Vec<u8>,
     current_match: Option<(QueryMatch<'query, 'tree>, usize)>,
-    _options: Option<QueryCursorOptionsDrop>,
+    _options: Option<QueryCursorOptionsDrop<'options>>,
     _phantom: PhantomData<(&'tree (), I)>,
 }
 
@@ -441,12 +450,13 @@ pub struct QueryCapture<'tree> {
     pub index: u32,
 }
 
-/// An error that occurred when trying to assign an incompatible [`Language`] to
-/// a [`Parser`]. If the `wasm` feature is enabled, this can also indicate a failure
-/// to load the Wasm store.
+/// An error that occurred when trying to assign a [`Language`] to a [`Parser`].
+/// If the `wasm` feature is enabled, this can also indicate a failure to load
+/// the Wasm store.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LanguageError {
     Version(usize),
+    NotParseable,
     #[cfg(feature = "wasm")]
     Wasm,
 }
@@ -502,10 +512,22 @@ impl Language {
         Self(unsafe { builder.into_raw()().cast() })
     }
 
+    /// Check whether this language can be assigned to a parser.
+    ///
+    /// When Tree-sitter is compiled to WebAssembly, languages obtained from a
+    /// syntax tree can be used for parsing only within the same WebAssembly
+    /// instance that created the tree. In other instances, such languages can
+    /// still be used to inspect syntax trees.
+    #[doc(alias = "ts_language_is_parseable")]
+    #[must_use]
+    pub fn is_parseable(&self) -> bool {
+        unsafe { ffi::ts_language_is_parseable(self.0) }
+    }
+
     /// Get the name of this language. This returns `None` in older parsers.
     #[doc(alias = "ts_language_name")]
     #[must_use]
-    pub fn name(&self) -> Option<&'static str> {
+    pub fn name(&self) -> Option<&str> {
         let ptr = unsafe { ffi::ts_language_name(self.0) };
         (!ptr.is_null()).then(|| unsafe { CStr::from_ptr(ptr) }.to_str().unwrap())
     }
@@ -579,7 +601,7 @@ impl Language {
     /// Get the name of the node kind for the given numerical id.
     #[doc(alias = "ts_language_symbol_name")]
     #[must_use]
-    pub fn node_kind_for_id(&self, id: u16) -> Option<&'static str> {
+    pub fn node_kind_for_id(&self, id: u16) -> Option<&str> {
         let ptr = unsafe { ffi::ts_language_symbol_name(self.0, id) };
         (!ptr.is_null()).then(|| unsafe { CStr::from_ptr(ptr) }.to_str().unwrap())
     }
@@ -628,7 +650,7 @@ impl Language {
     /// Get the field name for the given numerical id.
     #[doc(alias = "ts_language_field_name_for_id")]
     #[must_use]
-    pub fn field_name_for_id(&self, field_id: u16) -> Option<&'static str> {
+    pub fn field_name_for_id(&self, field_id: u16) -> Option<&str> {
         let ptr = unsafe { ffi::ts_language_field_name_for_id(self.0, field_id) };
         (!ptr.is_null()).then(|| unsafe { CStr::from_ptr(ptr) }.to_str().unwrap())
     }
@@ -667,14 +689,20 @@ impl Language {
     /// This returns `None` if state is invalid for this language.
     ///
     /// Iterating [`LookaheadIterator`] will yield valid symbols in the given
-    /// parse state. Newly created lookahead iterators will return the `ERROR`
-    /// symbol from [`LookaheadIterator::current_symbol`].
+    /// parse state. A newly created iterator is not positioned on a symbol, so
+    /// [`LookaheadIterator::current_symbol`] returns `None` until the first
+    /// [`Iterator::next`] call.
+    ///
+    /// The iterator retains the language, so the language may be dropped while
+    /// the iterator is still in use.
     ///
     /// Lookahead iterators can be useful to generate suggestions and improve
     /// syntax error diagnostics. To get symbols valid in an `ERROR` node, use the
-    /// lookahead iterator on its first leaf node state. For `MISSING` nodes, a
-    /// lookahead iterator created on the previous non-extra leaf node may be
-    /// appropriate.
+    /// lookahead iterator on its first leaf node state. For a missing node, use
+    /// the node's [`parse_state`](Node::parse_state). Keep in mind that lookahead
+    /// symbols are valid in that parse state, but are not necessarily valid
+    /// continuations in the context of the actual following token or guaranteed
+    /// to be considered during error recovery.
     #[doc(alias = "ts_lookahead_iterator_new")]
     #[must_use]
     pub fn lookahead_iterator(&self, state: u16) -> Option<LookaheadIterator> {
@@ -729,15 +757,17 @@ impl Parser {
     /// Set the language that the parser should use for parsing.
     ///
     /// Returns a Result indicating whether or not the language was successfully
-    /// assigned. True means assignment succeeded. False means there was a
-    /// version mismatch: the language was generated with an incompatible
-    /// version of the Tree-sitter CLI. Check the language's version using
-    /// [`Language::version`] and compare it to this library's
-    /// [`LANGUAGE_VERSION`] and [`MIN_COMPATIBLE_LANGUAGE_VERSION`] constants.
+    /// assigned. Assignment fails if the language cannot be used for parsing,
+    /// or if it was generated with an incompatible version of the Tree-sitter
+    /// CLI. Check this using [`Language::is_parseable`] and
+    /// [`Language::abi_version`].
     #[doc(alias = "ts_parser_set_language")]
     pub fn set_language(&mut self, language: &Language) -> Result<(), LanguageError> {
         let version = language.abi_version();
         if (MIN_COMPATIBLE_LANGUAGE_VERSION..=LANGUAGE_VERSION).contains(&version) {
+            if !language.is_parseable() {
+                return Err(LanguageError::NotParseable);
+            }
             #[cfg_attr(
                 not(feature = "wasm"),
                 expect(unused_variables, reason = "only used when wasm feature is enabled")
@@ -1471,6 +1501,11 @@ impl Tree {
     }
 
     /// Get the language that was used to parse the syntax tree.
+    ///
+    /// When Tree-sitter is compiled to WebAssembly, this returns the original
+    /// language if the tree is being accessed from the same WebAssembly
+    /// instance that created it. Otherwise, this returns a copy of the language
+    /// that can be used to inspect the tree but cannot be assigned to a parser.
     #[doc(alias = "ts_tree_language")]
     #[must_use]
     pub fn language(&self) -> LanguageRef {
@@ -1507,7 +1542,6 @@ impl Tree {
     /// functions. Call it on the old tree that was passed to parse, and
     /// pass the new tree that was returned from `parse`.
     #[doc(alias = "ts_tree_get_changed_ranges")]
-    #[must_use]
     pub fn changed_ranges(&self, other: &Self) -> impl ExactSizeIterator<Item = Range> {
         let mut count = 0u32;
         unsafe {
@@ -1618,7 +1652,7 @@ impl<'tree> Node<'tree> {
     /// Get this node's type as a string.
     #[doc(alias = "ts_node_type")]
     #[must_use]
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &'tree str {
         unsafe { CStr::from_ptr(ffi::ts_node_type(self.0)) }
             .to_str()
             .unwrap()
@@ -1628,13 +1662,19 @@ impl<'tree> Node<'tree> {
     /// aliases as a string.
     #[doc(alias = "ts_node_grammar_type")]
     #[must_use]
-    pub fn grammar_name(&self) -> &'static str {
+    pub fn grammar_name(&self) -> &'tree str {
         unsafe { CStr::from_ptr(ffi::ts_node_grammar_type(self.0)) }
             .to_str()
             .unwrap()
     }
 
     /// Get the [`Language`] that was used to parse this node's syntax tree.
+    ///
+    /// When Tree-sitter is compiled to WebAssembly, this returns the original
+    /// language if the node is being accessed from the same WebAssembly
+    /// instance that created its tree. Otherwise, this returns a copy of the
+    /// language that can be used to inspect the tree but cannot be assigned to
+    /// a parser.
     #[doc(alias = "ts_node_language")]
     #[must_use]
     pub fn language(&self) -> LanguageRef<'tree> {
@@ -1686,7 +1726,14 @@ impl<'tree> Node<'tree> {
         unsafe { ffi::ts_node_is_error(self.0) }
     }
 
-    /// Get this node's parse state.
+    /// Get the parse state immediately before this node.
+    ///
+    /// For a missing node, this is the state from the recovery path that was
+    /// selected by the parser. It can be used with
+    /// [`Language::lookahead_iterator`] to inspect the symbols that are valid in
+    /// that state. This does not necessarily include every symbol that could be
+    /// recovered by inserting a missing node, because the recovery process can
+    /// consider multiple stack versions.
     #[doc(alias = "ts_node_parse_state")]
     #[must_use]
     pub fn parse_state(&self) -> u16 {
@@ -1828,7 +1875,7 @@ impl<'tree> Node<'tree> {
     /// Get the field name of this node's child at the given index.
     #[doc(alias = "ts_node_field_name_for_child")]
     #[must_use]
-    pub fn field_name_for_child(&self, child_index: u32) -> Option<&'static str> {
+    pub fn field_name_for_child(&self, child_index: u32) -> Option<&'tree str> {
         unsafe {
             let ptr = ffi::ts_node_field_name_for_child(self.0, child_index);
             (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_str().unwrap())
@@ -1837,7 +1884,7 @@ impl<'tree> Node<'tree> {
 
     /// Get the field name of this node's named child at the given index.
     #[must_use]
-    pub fn field_name_for_named_child(&self, named_child_index: u32) -> Option<&'static str> {
+    pub fn field_name_for_named_child(&self, named_child_index: u32) -> Option<&'tree str> {
         unsafe {
             let ptr = ffi::ts_node_field_name_for_named_child(self.0, named_child_index);
             (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_str().unwrap())
@@ -2162,7 +2209,7 @@ impl<'tree> TreeCursor<'tree> {
     /// Get the field name of this tree cursor's current node.
     #[doc(alias = "ts_tree_cursor_current_field_name")]
     #[must_use]
-    pub fn field_name(&self) -> Option<&'static str> {
+    pub fn field_name(&self) -> Option<&'tree str> {
         unsafe {
             let ptr = ffi::ts_tree_cursor_current_field_name(&raw const self.0);
             (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_str().unwrap())
@@ -2325,22 +2372,34 @@ impl LookaheadIterator {
     }
 
     /// Get the current symbol of the lookahead iterator.
+    ///
+    /// Returns `None` if the iterator is not positioned on a symbol:
+    ///
+    /// - Before the first [`Iterator::next`] call
+    /// - After the iterator is exhausted
+    /// - After a [`Self::reset`] or [`Self::reset_state`] call
     #[doc(alias = "ts_lookahead_iterator_current_symbol")]
     #[must_use]
-    pub fn current_symbol(&self) -> u16 {
-        unsafe { ffi::ts_lookahead_iterator_current_symbol(self.0.as_ptr()) }
+    pub fn current_symbol(&self) -> Option<u16> {
+        // C signals "not positioned" through a null symbol name.
+        let name = unsafe { ffi::ts_lookahead_iterator_current_symbol_name(self.0.as_ptr()) };
+        (!name.is_null())
+            .then(|| unsafe { ffi::ts_lookahead_iterator_current_symbol(self.0.as_ptr()) })
     }
 
     /// Get the current symbol name of the lookahead iterator.
+    ///
+    /// Returns `None` if the iterator is not positioned on a symbol.
     #[doc(alias = "ts_lookahead_iterator_current_symbol_name")]
     #[must_use]
-    pub fn current_symbol_name(&self) -> &'static str {
+    pub fn current_symbol_name(&self) -> Option<&str> {
         unsafe {
-            CStr::from_ptr(ffi::ts_lookahead_iterator_current_symbol_name(
-                self.0.as_ptr(),
-            ))
-            .to_str()
-            .unwrap()
+            let name = ffi::ts_lookahead_iterator_current_symbol_name(self.0.as_ptr());
+            if name.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(name).to_str().unwrap())
+            }
         }
     }
 
@@ -2363,30 +2422,43 @@ impl LookaheadIterator {
     }
 
     /// Iterate symbol names.
-    pub fn iter_names(&mut self) -> impl Iterator<Item = &'static str> + '_ {
+    pub fn iter_names(&mut self) -> impl iter::FusedIterator<Item = &str> + '_ {
         LookaheadNamesIterator(self)
     }
 }
 
-impl Iterator for LookaheadNamesIterator<'_> {
-    type Item = &'static str;
+impl<'a> Iterator for LookaheadNamesIterator<'a> {
+    type Item = &'a str;
 
     #[doc(alias = "ts_lookahead_iterator_next")]
     fn next(&mut self) -> Option<Self::Item> {
-        unsafe { ffi::ts_lookahead_iterator_next(self.0.0.as_ptr()) }
-            .then(|| self.0.current_symbol_name())
+        let ptr = self.0.0.as_ptr();
+        // SAFETY: The borrow keeps the iterator (and the language refcount it holds)
+        // alive for `'a`. The name is non-null because the iterator is positioned
+        // whenever `next` returns `true`.
+        unsafe {
+            ffi::ts_lookahead_iterator_next(ptr).then(|| {
+                let name = ffi::ts_lookahead_iterator_current_symbol_name(ptr);
+                debug_assert!(!name.is_null());
+                CStr::from_ptr(name).to_str().unwrap()
+            })
+        }
     }
 }
+
+impl iter::FusedIterator for LookaheadNamesIterator<'_> {}
 
 impl Iterator for LookaheadIterator {
     type Item = u16;
 
     #[doc(alias = "ts_lookahead_iterator_next")]
     fn next(&mut self) -> Option<Self::Item> {
-        // the first symbol is always `0` so we can safely skip it
-        unsafe { ffi::ts_lookahead_iterator_next(self.0.as_ptr()) }.then(|| self.current_symbol())
+        unsafe { ffi::ts_lookahead_iterator_next(self.0.as_ptr()) }
+            .then(|| unsafe { ffi::ts_lookahead_iterator_current_symbol(self.0.as_ptr()) })
     }
 }
+
+impl iter::FusedIterator for LookaheadIterator {}
 
 impl Drop for LookaheadIterator {
     #[doc(alias = "ts_lookahead_iterator_delete")]
@@ -3088,7 +3160,7 @@ impl QueryCursor {
         query: &'query Query,
         node: Node<'tree>,
         text_provider: T,
-    ) -> QueryMatches<'query, 'tree, T, I> {
+    ) -> QueryMatches<'query, 'tree, 'static, T, I> {
         let ptr = self.ptr.as_ptr();
         unsafe { ffi::ts_query_cursor_exec(ptr, query.ptr.as_ptr(), node.0) };
         QueryMatches {
@@ -3114,6 +3186,7 @@ impl QueryCursor {
         'query,
         'cursor: 'query,
         'tree,
+        'options,
         T: TextProvider<I>,
         I: AsRef<[u8]>,
     >(
@@ -3121,8 +3194,8 @@ impl QueryCursor {
         query: &'query Query,
         node: Node<'tree>,
         text_provider: T,
-        options: QueryCursorOptions,
-    ) -> QueryMatches<'query, 'tree, T, I> {
+        options: QueryCursorOptions<'options>,
+    ) -> QueryMatches<'query, 'tree, 'options, T, I> {
         unsafe extern "C" fn progress(state: *mut ffi::TSQueryCursorState) -> bool {
             unsafe {
                 let callback = (*state)
@@ -3138,10 +3211,13 @@ impl QueryCursor {
         }
 
         let query_options = options.progress_callback.map(|cb| {
-            QueryCursorOptionsDrop(Box::into_raw(Box::new(ffi::TSQueryCursorOptions {
-                payload: Box::into_raw(Box::new(cb)).cast::<c_void>(),
-                progress_callback: Some(progress),
-            })))
+            QueryCursorOptionsDrop(
+                Box::into_raw(Box::new(ffi::TSQueryCursorOptions {
+                    payload: Box::into_raw(Box::new(cb)).cast::<c_void>(),
+                    progress_callback: Some(progress),
+                })),
+                PhantomData,
+            )
         });
 
         let ptr = self.ptr.as_ptr();
@@ -3180,7 +3256,7 @@ impl QueryCursor {
         query: &'query Query,
         node: Node<'tree>,
         text_provider: T,
-    ) -> QueryCaptures<'query, 'tree, T, I> {
+    ) -> QueryCaptures<'query, 'tree, 'static, T, I> {
         let ptr = self.ptr.as_ptr();
         unsafe { ffi::ts_query_cursor_exec(ptr, query.ptr.as_ptr(), node.0) };
         QueryCaptures {
@@ -3205,6 +3281,7 @@ impl QueryCursor {
         'query,
         'cursor: 'query,
         'tree,
+        'options,
         T: TextProvider<I>,
         I: AsRef<[u8]>,
     >(
@@ -3212,8 +3289,8 @@ impl QueryCursor {
         query: &'query Query,
         node: Node<'tree>,
         text_provider: T,
-        options: QueryCursorOptions,
-    ) -> QueryCaptures<'query, 'tree, T, I> {
+        options: QueryCursorOptions<'options>,
+    ) -> QueryCaptures<'query, 'tree, 'options, T, I> {
         unsafe extern "C" fn progress(state: *mut ffi::TSQueryCursorState) -> bool {
             unsafe {
                 let callback = (*state)
@@ -3229,10 +3306,13 @@ impl QueryCursor {
         }
 
         let query_options = options.progress_callback.map(|cb| {
-            QueryCursorOptionsDrop(Box::into_raw(Box::new(ffi::TSQueryCursorOptions {
-                payload: Box::into_raw(Box::new(cb)).cast::<c_void>(),
-                progress_callback: Some(progress),
-            })))
+            QueryCursorOptionsDrop(
+                Box::into_raw(Box::new(ffi::TSQueryCursorOptions {
+                    payload: Box::into_raw(Box::new(cb)).cast::<c_void>(),
+                    progress_callback: Some(progress),
+                })),
+                PhantomData,
+            )
         });
 
         let ptr = self.ptr.as_ptr();
@@ -3510,7 +3590,7 @@ impl QueryProperty {
 /// underlying object in the C library gets updated on each iteration. Copies would
 /// have their internal state overwritten, leading to Undefined Behavior
 impl<'query, 'tree, T: TextProvider<I>, I: AsRef<[u8]>> StreamingIterator
-    for QueryMatches<'query, 'tree, T, I>
+    for QueryMatches<'query, 'tree, '_, T, I>
 {
     type Item = QueryMatch<'query, 'tree>;
 
@@ -3540,14 +3620,14 @@ impl<'query, 'tree, T: TextProvider<I>, I: AsRef<[u8]>> StreamingIterator
     }
 }
 
-impl<T: TextProvider<I>, I: AsRef<[u8]>> StreamingIteratorMut for QueryMatches<'_, '_, T, I> {
+impl<T: TextProvider<I>, I: AsRef<[u8]>> StreamingIteratorMut for QueryMatches<'_, '_, '_, T, I> {
     fn get_mut(&mut self) -> Option<&mut Self::Item> {
         self.current_match.as_mut()
     }
 }
 
 impl<'query, 'tree, T: TextProvider<I>, I: AsRef<[u8]>> StreamingIterator
-    for QueryCaptures<'query, 'tree, T, I>
+    for QueryCaptures<'query, 'tree, '_, T, I>
 {
     type Item = (QueryMatch<'query, 'tree>, usize);
 
@@ -3583,13 +3663,13 @@ impl<'query, 'tree, T: TextProvider<I>, I: AsRef<[u8]>> StreamingIterator
     }
 }
 
-impl<T: TextProvider<I>, I: AsRef<[u8]>> StreamingIteratorMut for QueryCaptures<'_, '_, T, I> {
+impl<T: TextProvider<I>, I: AsRef<[u8]>> StreamingIteratorMut for QueryCaptures<'_, '_, '_, T, I> {
     fn get_mut(&mut self) -> Option<&mut Self::Item> {
         self.current_match.as_mut()
     }
 }
 
-impl<T: TextProvider<I>, I: AsRef<[u8]>> QueryMatches<'_, '_, T, I> {
+impl<T: TextProvider<I>, I: AsRef<[u8]>> QueryMatches<'_, '_, '_, T, I> {
     #[doc(alias = "ts_query_cursor_set_byte_range")]
     pub fn set_byte_range(&mut self, range: ops::Range<usize>) {
         unsafe {
@@ -3605,7 +3685,7 @@ impl<T: TextProvider<I>, I: AsRef<[u8]>> QueryMatches<'_, '_, T, I> {
     }
 }
 
-impl<T: TextProvider<I>, I: AsRef<[u8]>> QueryCaptures<'_, '_, T, I> {
+impl<T: TextProvider<I>, I: AsRef<[u8]>> QueryCaptures<'_, '_, '_, T, I> {
     #[doc(alias = "ts_query_cursor_set_byte_range")]
     pub fn set_byte_range(&mut self, range: ops::Range<usize>) {
         unsafe {
@@ -3808,6 +3888,9 @@ impl fmt::Display for LanguageError {
                     f,
                     "Incompatible language version {version}. Expected minimum {MIN_COMPATIBLE_LANGUAGE_VERSION}, maximum {LANGUAGE_VERSION}",
                 )
+            }
+            Self::NotParseable => {
+                write!(f, "Language cannot be used for parsing.")
             }
             #[cfg(feature = "wasm")]
             Self::Wasm => {
@@ -4016,19 +4099,27 @@ impl error::Error for LanguageError {}
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 impl error::Error for QueryError {}
 
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Send for Language {}
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Sync for Language {}
 
 unsafe impl Send for Node<'_> {}
 unsafe impl Sync for Node<'_> {}
 
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Send for LookaheadIterator {}
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Sync for LookaheadIterator {}
 
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Send for LookaheadNamesIterator<'_> {}
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Sync for LookaheadNamesIterator<'_> {}
 
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Send for Parser {}
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Sync for Parser {}
 
 unsafe impl Send for Query {}

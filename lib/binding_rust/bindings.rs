@@ -203,7 +203,7 @@ unsafe extern "C" {
     pub fn ts_parser_language(self_: *const TSParser) -> *const TSLanguage;
 }
 unsafe extern "C" {
-    #[doc = " Set the language that the parser should use for parsing.\n\n Returns a boolean indicating whether or not the language was successfully\n assigned. True means assignment succeeded. False means there was a version\n mismatch: the language was generated with an incompatible version of the\n Tree-sitter CLI. Check the language's ABI version using [`ts_language_abi_version`]\n and compare it to this library's [`TREE_SITTER_LANGUAGE_VERSION`] and\n [`TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION`] constants."]
+    #[doc = " Set the language that the parser should use for parsing.\n\n Returns a boolean indicating whether or not the language was successfully\n assigned. True means assignment succeeded. False means the language cannot\n be used for parsing, or it was generated with an incompatible version of the\n Tree-sitter CLI. Check whether the language can be used for parsing with\n [`ts_language_is_parseable`]. Check the language's ABI version using\n [`ts_language_abi_version`] and compare it to this library's\n [`TREE_SITTER_LANGUAGE_VERSION`] and\n [`TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION`] constants."]
     pub fn ts_parser_set_language(self_: *mut TSParser, language: *const TSLanguage) -> bool;
 }
 unsafe extern "C" {
@@ -291,7 +291,7 @@ unsafe extern "C" {
     ) -> TSNode;
 }
 unsafe extern "C" {
-    #[doc = " Get the language that was used to parse the syntax tree."]
+    #[doc = " Get the language that was used to parse the syntax tree.\n\n When Tree-sitter is compiled to WebAssembly, this returns the original\n language if the tree is being accessed from the same WebAssembly instance\n that created it. Otherwise, this returns a copy of the language that can be\n used to inspect the tree but cannot be assigned to a parser."]
     pub fn ts_tree_language(self_: *const TSTree) -> *const TSLanguage;
 }
 unsafe extern "C" {
@@ -323,7 +323,7 @@ unsafe extern "C" {
     pub fn ts_node_symbol(self_: TSNode) -> TSSymbol;
 }
 unsafe extern "C" {
-    #[doc = " Get the node's language."]
+    #[doc = " Get the node's language.\n\n When Tree-sitter is compiled to WebAssembly, this returns the original\n language if the node is being accessed from the same WebAssembly instance\n that created its tree. Otherwise, this returns a copy of the language that\n can be used to inspect the tree but cannot be assigned to a parser."]
     pub fn ts_node_language(self_: TSNode) -> *const TSLanguage;
 }
 unsafe extern "C" {
@@ -383,7 +383,7 @@ unsafe extern "C" {
     pub fn ts_node_is_error(self_: TSNode) -> bool;
 }
 unsafe extern "C" {
-    #[doc = " Get this node's parse state."]
+    #[doc = " Get this node's parse state.\n\n For a missing node, this is the state from the recovery path that was\n selected by the parser. It can be used with [`ts_lookahead_iterator_new`] to\n inspect the symbols that are valid in that state. This does not necessarily\n include every symbol that could be recovered by inserting a missing node."]
     pub fn ts_node_parse_state(self_: TSNode) -> TSStateId;
 }
 unsafe extern "C" {
@@ -762,6 +762,10 @@ unsafe extern "C" {
     pub fn ts_language_delete(self_: *const TSLanguage);
 }
 unsafe extern "C" {
+    #[doc = " Check whether this language can be assigned to a parser.\n\n Languages obtained from a syntax tree may be used to inspect that tree, but\n are not necessarily usable for parsing. When Tree-sitter is compiled to\n WebAssembly, a language obtained from a tree can be used for parsing only\n within the same WebAssembly instance that created the tree, because lexer\n function pointers are local to a WebAssembly instance."]
+    pub fn ts_language_is_parseable(self_: *const TSLanguage) -> bool;
+}
+unsafe extern "C" {
     #[doc = " Get the number of distinct node types in the language."]
     pub fn ts_language_symbol_count(self_: *const TSLanguage) -> u32;
 }
@@ -841,7 +845,7 @@ unsafe extern "C" {
     pub fn ts_language_name(self_: *const TSLanguage) -> *const ::core::ffi::c_char;
 }
 unsafe extern "C" {
-    #[doc = " Create a new lookahead iterator for the given language and parse state.\n\n This returns `NULL` if state is invalid for the language.\n\n Repeatedly using [`ts_lookahead_iterator_next`] and\n [`ts_lookahead_iterator_current_symbol`] will generate valid symbols in the\n given parse state. Newly created lookahead iterators will contain the `ERROR`\n symbol.\n\n Lookahead iterators can be useful to generate suggestions and improve syntax\n error diagnostics. To get symbols valid in an ERROR node, use the lookahead\n iterator on its first leaf node state. For `MISSING` nodes, a lookahead\n iterator created on the previous non-extra leaf node may be appropriate."]
+    #[doc = " Create a new lookahead iterator for the given language and parse state.\n\n This returns `NULL` if state is invalid for the language.\n\n Repeatedly using [`ts_lookahead_iterator_next`] and\n [`ts_lookahead_iterator_current_symbol`] will generate valid symbols in the\n given parse state. A newly created iterator is not positioned on a symbol\n until [`ts_lookahead_iterator_next`] is called.\n\n The iterator retains the language, so the language may be deleted while the\n iterator is still in use.\n\n Lookahead iterators can be useful to generate suggestions and improve syntax\n error diagnostics. To get symbols valid in an ERROR node, use the lookahead\n iterator on its first leaf node state. For `MISSING` nodes, a lookahead\n iterator created on the previous non-extra leaf node, or using the node's\n parse state may be appropriate."]
     pub fn ts_lookahead_iterator_new(
         self_: *const TSLanguage,
         state: TSStateId,
@@ -852,14 +856,14 @@ unsafe extern "C" {
     pub fn ts_lookahead_iterator_delete(self_: *mut TSLookaheadIterator);
 }
 unsafe extern "C" {
-    #[doc = " Reset the lookahead iterator to another state.\n\n This returns `true` if the iterator was reset to the given state and `false`\n otherwise."]
+    #[doc = " Reset the lookahead iterator to another state.\n\n This returns `true` if the iterator was reset to the given state and `false`\n otherwise. A reset iterator is not positioned on a symbol."]
     pub fn ts_lookahead_iterator_reset_state(
         self_: *mut TSLookaheadIterator,
         state: TSStateId,
     ) -> bool;
 }
 unsafe extern "C" {
-    #[doc = " Reset the lookahead iterator.\n\n This returns `true` if the language was set successfully and `false`\n otherwise."]
+    #[doc = " Reset the lookahead iterator.\n\n This returns `true` if the language was set successfully and `false`\n otherwise. A reset iterator is not positioned on a symbol."]
     pub fn ts_lookahead_iterator_reset(
         self_: *mut TSLookaheadIterator,
         language: *const TSLanguage,
@@ -875,11 +879,11 @@ unsafe extern "C" {
     pub fn ts_lookahead_iterator_next(self_: *mut TSLookaheadIterator) -> bool;
 }
 unsafe extern "C" {
-    #[doc = " Get the current symbol of the lookahead iterator;"]
+    #[doc = " Get the current symbol of the lookahead iterator.\n\n This is only meaningful when the most recent call to\n [`ts_lookahead_iterator_next`] on `self` returned `true`."]
     pub fn ts_lookahead_iterator_current_symbol(self_: *const TSLookaheadIterator) -> TSSymbol;
 }
 unsafe extern "C" {
-    #[doc = " Get the current symbol type of the lookahead iterator as a null terminated\n string."]
+    #[doc = " Get the current symbol type of the lookahead iterator as a null terminated\n string.\n\n This returns `NULL` unless the most recent call to\n [`ts_lookahead_iterator_next`] on `self` returned `true`."]
     pub fn ts_lookahead_iterator_current_symbol_name(
         self_: *const TSLookaheadIterator,
     ) -> *const ::core::ffi::c_char;
