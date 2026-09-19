@@ -75,7 +75,7 @@ pub fn query_file_at_path(
     if opts.ordered_captures {
         let mut captures = query_cursor.captures(&query, tree.root_node(), source_code.as_slice());
         while let Some((mat, capture_index)) = captures.next() {
-            let capture = mat.captures[*capture_index];
+            let capture = mat.captures()[*capture_index];
             let capture_name = &query.capture_names()[capture.index as usize];
             if !opts.quiet && !should_test {
                 writeln!(
@@ -102,7 +102,7 @@ pub fn query_file_at_path(
             if !opts.quiet && !should_test {
                 writeln!(&mut stdout, "  pattern: {}", m.pattern_index)?;
             }
-            for capture in m.captures {
+            for capture in m.captures() {
                 let start = capture.node.start_position();
                 let end = capture.node.end_position();
                 let capture_name = &query.capture_names()[capture.index as usize];
@@ -142,7 +142,9 @@ pub fn query_file_at_path(
         };
         // Invariant: `test_summary` will always be `Some` when `should_test` is true
         let test_summary = test_summary.unwrap();
-        match query_testing::assert_expected_captures(&results, path, &mut parser, language) {
+        let assertions =
+            query_testing::parse_position_comments(&mut parser, language, source_code.as_slice())?;
+        match query_testing::assert_expected_captures(&results, &assertions) {
             Ok(assertion_count) => {
                 test_summary.query_results.add_case(TestResult {
                     name: path_name.to_string(),

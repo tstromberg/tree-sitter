@@ -1,4 +1,4 @@
-VERSION := 0.27.0
+VERSION := 0.28.0
 DESCRIPTION := An incremental parsing system for programming tools
 HOMEPAGE_URL := https://tree-sitter.github.io/tree-sitter/
 
@@ -129,8 +129,13 @@ lint-web:
 	npm --prefix lib/binding_web ci
 	npm --prefix lib/binding_web run lint
 
+lint-toml:
+	taplo check
+	taplo format --check --diff
+
 format:
 	cargo fmt --all
+	taplo format
 
 changelog:
 	@git-cliff --config .github/cliff.toml --prepend CHANGELOG.md --latest --github-token $(shell gh auth token)
