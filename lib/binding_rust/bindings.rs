@@ -703,6 +703,8 @@ unsafe extern "C" {
     #[doc = " Get/set the maximum number of in-progress states one pattern may hold at one start depth."]
     pub fn ts_query_cursor_max_states_per_group(self_: *const TSQueryCursor) -> u32;
     pub fn ts_query_cursor_set_max_states_per_group(self_: *mut TSQueryCursor, limit: u32);
+    #[doc = " Whether a state of the given pattern was abandoned during the last execution."]
+    pub fn ts_query_cursor_pattern_exceeded(self_: *const TSQueryCursor, pattern_index: u32) -> bool;
 }
 unsafe extern "C" {
     #[doc = " Set the range of bytes in which the query will be executed.\n\n The query cursor will return matches that intersect with the given byte range.\n This means that a match may be returned even if some of its captures fall\n outside the specified range, as long as at least part of the match\n overlaps with the range.\n\n For example, if a query pattern matches a node that spans a larger area\n than the specified range, but part of that node intersects with the range,\n the entire match will be returned.\n\n NOTE: An `end_byte` of zero is interpreted as `UINT32_MAX`, making the range\n unbounded.\n\n This will return `false` if the start byte is greater than the end byte, otherwise\n it will return `true`."]

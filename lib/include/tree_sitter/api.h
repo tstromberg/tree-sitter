@@ -1122,6 +1122,14 @@ void ts_query_cursor_set_match_limit(TSQueryCursor *self, uint32_t limit);
  * children. Zero restores "unlimited".
  */
 uint32_t ts_query_cursor_max_states_per_group(const TSQueryCursor *self);
+
+/**
+ * Whether a state of the given pattern was abandoned during the last
+ * execution (capture-list pool exhausted or the per-group state cap hit), i.e.
+ * whether that pattern's matches may be incomplete. Lets a caller that batches
+ * many patterns in one cursor keep the complete ones and re-run the rest.
+ */
+bool ts_query_cursor_pattern_exceeded(const TSQueryCursor *self, uint32_t pattern_index);
 void ts_query_cursor_set_max_states_per_group(TSQueryCursor *self, uint32_t limit);
 
 /**

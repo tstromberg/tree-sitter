@@ -3176,6 +3176,19 @@ impl QueryCursor {
         unsafe { ffi::ts_query_cursor_did_exceed_match_limit(self.ptr.as_ptr()) }
     }
 
+    /// Check if, on its last execution, this cursor abandoned any state of the
+    /// given pattern, i.e. whether that pattern's matches may be incomplete.
+    /// Lets a caller batching many patterns in one cursor keep the complete
+    /// patterns' results and re-run only the limited ones.
+    #[doc(alias = "ts_query_cursor_pattern_exceeded")]
+    #[must_use]
+    pub fn pattern_exceeded(&self, pattern_index: usize) -> bool {
+        let Ok(index) = u32::try_from(pattern_index) else {
+            return false;
+        };
+        unsafe { ffi::ts_query_cursor_pattern_exceeded(self.ptr.as_ptr(), index) }
+    }
+
     /// Iterate over all of the matches in the order that they were found.
     ///
     /// Each match contains the index of the pattern that matched, and a list of

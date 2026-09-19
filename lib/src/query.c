@@ -351,6 +351,10 @@ struct TSQueryCursor {
   bool halted;
   bool did_exceed_match_limit;
   uint32_t max_states_per_group;
+  // One flag per pattern: set when a state of that pattern was abandoned, so a
+  // caller batching many patterns in one cursor can tell which results are
+  // partial and re-run only those.
+  Array(uint8_t) exceeded_patterns;
 };
 
 static const TSQueryError PARENT_DONE = -1;
@@ -3427,6 +3431,7 @@ TSQueryCursor *ts_query_cursor_new(void) {
   *self = (TSQueryCursor) {
     .did_exceed_match_limit = false,
     .max_states_per_group = DEFAULT_MAX_STATES_PER_GROUP,
+    .exceeded_patterns = array_new(),
     .ascending = false,
     .halted = false,
     .states = array_new(),
@@ -3457,11 +3462,29 @@ void ts_query_cursor_delete(TSQueryCursor *self) {
   array_delete(&self->finished_states);
   ts_tree_cursor_delete(&self->cursor);
   capture_list_pool_delete(&self->capture_list_pool);
+  array_delete(&self->exceeded_patterns);
   ts_free(self);
 }
 
 bool ts_query_cursor_did_exceed_match_limit(const TSQueryCursor *self) {
   return self->did_exceed_match_limit;
+}
+
+bool ts_query_cursor_pattern_exceeded(const TSQueryCursor *self, uint32_t pattern_index) {
+  return
+    pattern_index < self->exceeded_patterns.size &&
+    *array_get(&self->exceeded_patterns, pattern_index);
+}
+
+static void ts_query_cursor__mark_pattern_exceeded(TSQueryCursor *self, uint32_t pattern_index) {
+  self->did_exceed_match_limit = true;
+  if (!self->query) return;
+  uint32_t count = self->query->patterns.size;
+  if (pattern_index >= count) return;
+  while (self->exceeded_patterns.size < count) {
+    array_push(&self->exceeded_patterns, 0);
+  }
+  *array_get(&self->exceeded_patterns, pattern_index) = 1;
 }
 
 uint32_t ts_query_cursor_match_limit(const TSQueryCursor *self) {
@@ -3530,6 +3553,7 @@ void ts_query_cursor_exec(
   self->halted = false;
   self->query = query;
   self->did_exceed_match_limit = false;
+  array_clear(&self->exceeded_patterns);
   self->operation_count = 0;
   self->query_options = NULL;
   self->query_state = (TSQueryCursorState) {0};
@@ -3881,6 +3905,7 @@ static CaptureList *ts_query_cursor__prepare_to_capture(
           "  abandon state. index:%u, pattern:%u, offset:%u.\n",
           state_index, pattern_index, byte_offset
         );
+        ts_query_cursor__mark_pattern_exceeded(self, pattern_index);
         QueryState *other_state = array_get(&self->states, state_index);
         state->capture_list_id = other_state->capture_list_id;
         other_state->capture_list_id = CAPTURE_LIST_NONE;
@@ -4549,7 +4574,7 @@ static inline bool ts_query_cursor__advance(
             }
           }
           if (j - group_start >= self->max_states_per_group) {
-            self->did_exceed_match_limit = true;
+            ts_query_cursor__mark_pattern_exceeded(self, state->pattern_index);
             LOG(
               "  abandon state (group cap). pattern: %u, start_depth: %u\n",
               state->pattern_index,
