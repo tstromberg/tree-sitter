@@ -3149,6 +3149,25 @@ impl QueryCursor {
         }
     }
 
+    /// Set the maximum number of in-progress states one pattern may hold at one
+    /// start depth (default 256). States past the cap are abandoned and
+    /// [`QueryCursor::did_exceed_match_limit`] reports the results as partial.
+    /// This bounds the per-step cost of patterns whose unanchored wildcard
+    /// siblings explode against nodes with thousands of children.
+    #[doc(alias = "ts_query_cursor_set_max_states_per_group")]
+    pub fn set_max_states_per_group(&mut self, limit: u32) {
+        unsafe {
+            ffi::ts_query_cursor_set_max_states_per_group(self.ptr.as_ptr(), limit);
+        }
+    }
+
+    /// Get the current per-pattern-group state cap.
+    #[doc(alias = "ts_query_cursor_max_states_per_group")]
+    #[must_use]
+    pub fn max_states_per_group(&self) -> u32 {
+        unsafe { ffi::ts_query_cursor_max_states_per_group(self.ptr.as_ptr()) }
+    }
+
     /// Check if, on its last execution, this cursor exceeded its maximum number
     /// of in-progress matches.
     #[doc(alias = "ts_query_cursor_did_exceed_match_limit")]

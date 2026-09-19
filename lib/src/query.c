@@ -27,6 +27,7 @@
 #define MAX_STEP_CAPTURE_COUNT 3
 #define MAX_NEGATED_FIELD_COUNT 8
 #define MAX_STATE_PREDECESSOR_COUNT 256
+#define DEFAULT_MAX_STATES_PER_GROUP 256
 #define MAX_ANALYSIS_STATE_DEPTH 8
 #define MAX_ANALYSIS_ITERATION_COUNT 256
 
@@ -349,6 +350,7 @@ struct TSQueryCursor {
   bool ascending;
   bool halted;
   bool did_exceed_match_limit;
+  uint32_t max_states_per_group;
 };
 
 static const TSQueryError PARENT_DONE = -1;
@@ -3424,6 +3426,7 @@ TSQueryCursor *ts_query_cursor_new(void) {
   TSQueryCursor *self = ts_malloc(sizeof(TSQueryCursor));
   *self = (TSQueryCursor) {
     .did_exceed_match_limit = false,
+    .max_states_per_group = DEFAULT_MAX_STATES_PER_GROUP,
     .ascending = false,
     .halted = false,
     .states = array_new(),
@@ -3463,6 +3466,14 @@ bool ts_query_cursor_did_exceed_match_limit(const TSQueryCursor *self) {
 
 uint32_t ts_query_cursor_match_limit(const TSQueryCursor *self) {
   return self->capture_list_pool.max_capture_list_count;
+}
+
+uint32_t ts_query_cursor_max_states_per_group(const TSQueryCursor *self) {
+  return self->max_states_per_group;
+}
+
+void ts_query_cursor_set_max_states_per_group(TSQueryCursor *self, uint32_t limit) {
+  self->max_states_per_group = limit ? limit : UINT32_MAX;
 }
 
 void ts_query_cursor_set_match_limit(TSQueryCursor *self, uint32_t limit) {
@@ -4512,9 +4523,39 @@ static inline bool ts_query_cursor__advance(
         // group once the remaining states are disjoint from the current one.
         ts_query_cursor__sort_states_by_capture(self);
 
+        // Bound the number of in-progress states per (start_depth, pattern) group.
+        // A pattern with several unanchored wildcard siblings (`argument: (_) @a
+        // argument: (_) @b`) explores every alignment against a node with thousands
+        // of children, and the pairwise longest-match dedup below is quadratic in
+        // the group size: 50k states in one group cost ~10^9 comparisons per step
+        // and no progress callback can interrupt a single step. Past the cap, the
+        // states that sort last in the group (latest first capture) are abandoned
+        // and `did_exceed_match_limit` records that the results are partial.
+        unsigned group_start = 0;
         for (unsigned j = 0; j < self->states.size; j++) {
           QueryState *state = array_get(&self->states, j);
           if (state->dead) {
+            array_erase(&self->states, j);
+            j--;
+            continue;
+          }
+          if (j > 0) {
+            QueryState *prev = array_get(&self->states, j - 1);
+            if (
+              prev->start_depth != state->start_depth ||
+              prev->pattern_index != state->pattern_index
+            ) {
+              group_start = j;
+            }
+          }
+          if (j - group_start >= self->max_states_per_group) {
+            self->did_exceed_match_limit = true;
+            LOG(
+              "  abandon state (group cap). pattern: %u, start_depth: %u\n",
+              state->pattern_index,
+              state->start_depth
+            );
+            capture_list_pool_release(&self->capture_list_pool, state->capture_list_id);
             array_erase(&self->states, j);
             j--;
             continue;

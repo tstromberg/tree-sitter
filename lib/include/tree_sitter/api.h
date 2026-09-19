@@ -1115,6 +1115,16 @@ uint32_t ts_query_cursor_match_limit(const TSQueryCursor *self);
 void ts_query_cursor_set_match_limit(TSQueryCursor *self, uint32_t limit);
 
 /**
+ * Get/set the maximum number of in-progress states one pattern may hold at one
+ * start depth. States past the cap are abandoned and `did_exceed_match_limit`
+ * is set. Bounds the (quadratic) per-step cost of matching patterns whose
+ * unanchored wildcard siblings explode against nodes with thousands of
+ * children. Zero restores "unlimited".
+ */
+uint32_t ts_query_cursor_max_states_per_group(const TSQueryCursor *self);
+void ts_query_cursor_set_max_states_per_group(TSQueryCursor *self, uint32_t limit);
+
+/**
  * Set the range of bytes in which the query will be executed.
  *
  * The query cursor will return matches that intersect with the given byte range.
