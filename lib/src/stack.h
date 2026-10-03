@@ -122,6 +122,11 @@ StackVersion ts_stack_copy_version(Stack *self, StackVersion version);
 // Remove the given version from the stack.
 void ts_stack_remove_version(Stack *self, StackVersion version);
 
+// The stack nodes visited and freed since the last call, in whole units of
+// `unit` nodes; the remainder carries over. The parser counts these units
+// toward the operations its progress callback is paced by.
+uint32_t ts_stack_take_work(Stack *self, uint32_t unit);
+
 void ts_stack_clear(Stack *self);
 
 bool ts_stack_print_dot_graph(Stack *self, const TSLanguage *language, FILE *f);

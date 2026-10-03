@@ -80,6 +80,13 @@ static const unsigned MAX_SUMMARY_DEPTH = 16;
 static const unsigned MAX_COST_DIFFERENCE = 18 * ERROR_COST_PER_SKIPPED_TREE;
 static const unsigned OP_COUNT_PER_PARSER_CALLBACK_CHECK = 100;
 
+// Stack nodes walked or freed that count as one parse operation. Input the
+// grammar finds ambiguous forks the stack, and walking and freeing the forks
+// -- not the parse actions -- becomes the cost of the parse. Counting that
+// work paces the progress callback by cost, so a caller that budgets
+// callbacks budgets time, the same way on every machine.
+static const unsigned STACK_WORK_PER_OPERATION = 32;
+
 typedef struct {
   Subtree token;
   Subtree last_external_token;
@@ -1572,22 +1579,21 @@ static void ts_parser__handle_error(
 }
 
 static bool ts_parser__check_progress(TSParser *self, Subtree *lookahead, const uint32_t *position, unsigned operations) {
-  self->operation_count += operations;
-  if (self->operation_count >= OP_COUNT_PER_PARSER_CALLBACK_CHECK) {
-    self->operation_count = 0;
-  }
+  self->operation_count += operations + ts_stack_take_work(self->stack, STACK_WORK_PER_OPERATION);
   if (position != NULL) {
     self->parse_state.current_byte_offset = *position;
     self->parse_state.has_error = self->has_error;
   }
-  if (
-    self->operation_count == 0 &&
-    (self->parse_options.progress_callback && self->parse_options.progress_callback(&self->parse_state))
-  ) {
-    if (lookahead && lookahead->ptr) {
-      ts_subtree_release(&self->tree_pool, *lookahead);
+  // One callback per OP_COUNT_PER_PARSER_CALLBACK_CHECK operations, however
+  // many arrive at once, so a callback that counts its calls counts work.
+  while (self->operation_count >= OP_COUNT_PER_PARSER_CALLBACK_CHECK) {
+    self->operation_count -= OP_COUNT_PER_PARSER_CALLBACK_CHECK;
+    if (self->parse_options.progress_callback && self->parse_options.progress_callback(&self->parse_state)) {
+      if (lookahead && lookahead->ptr) {
+        ts_subtree_release(&self->tree_pool, *lookahead);
+      }
+      return false;
     }
-    return false;
   }
   return true;
 }

@@ -1171,11 +1171,14 @@ fn test_parsing_with_timeout_when_error_detected() {
         })),
     );
 
-    // The callback is called at the end of parsing, however, what we're asserting here is that
-    // parsing ends immediately as the error is detected. This is verified by checking the offset
-    // of the last byte processed is the length of the erroneous code we inserted, aka, 1002, or
-    // 1000 + the length of the erroneous code.
-    assert_eq!(offset, 1000 + erroneous_code.len());
+    // The callback runs once per fixed amount of parsing work, so what we can assert is that
+    // parsing ends within one callback interval of the error: past the erroneous code, aka
+    // 1000 + its length, but long before the infinite input would have run out.
+    let error_end = 1000 + erroneous_code.len();
+    assert!(
+        (error_end..error_end + 200).contains(&offset),
+        "parse ran to {offset}, error ends at {error_end}"
+    );
     assert!(tree.is_none());
 }
 
