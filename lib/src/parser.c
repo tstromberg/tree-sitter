@@ -2144,7 +2144,10 @@ TSTree *ts_parser_parse(
   array_clear(&self->included_range_differences);
   self->included_range_difference_index = 0;
 
+  // Count only this parse's work: drop what clearing the last one left behind,
+  // or the same input would be paced differently on a reused parser.
   self->operation_count = 0;
+  ts_stack_take_work(self->stack, 1);
 
   if (ts_parser_has_outstanding_parse(self)) {
     LOG("resume_parsing");

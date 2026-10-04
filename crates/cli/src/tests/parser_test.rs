@@ -1146,6 +1146,40 @@ fn test_parsing_with_timeout_during_balancing() {
     });
 }
 
+/// The work an ambiguous parse spends walking and freeing its forked stacks
+/// paces the progress callback, and must pace it the same way every time: a
+/// caller that budgets callbacks has to stop the same input at the same point,
+/// on a fresh parser or a reused one.
+#[test]
+fn test_parsing_progress_is_the_same_on_a_reused_parser() {
+    /// The byte offset the parser had reached at each callback.
+    fn callbacks(parser: &mut Parser, source: &[u8]) -> Vec<usize> {
+        let mut offsets = Vec::new();
+        parser.parse_with_options(
+            &mut |i, _| source.get(i..).unwrap_or_default(),
+            None,
+            Some(ParseOptions::new().progress_callback(&mut |state| {
+                offsets.push(state.current_byte_offset());
+                ControlFlow::Continue(())
+            })),
+        );
+        offsets
+    }
+
+    // `(a)*b` is a cast or a multiplication, so the C parser keeps both
+    // readings alive across the whole chain.
+    let source = format!("int x = {}a;\n", "(a)*".repeat(5_000));
+    let mut parser = Parser::new();
+    parser.set_language(&get_language("c")).unwrap();
+    let first = callbacks(&mut parser, source.as_bytes());
+    assert!(!first.is_empty());
+    assert_eq!(callbacks(&mut parser, source.as_bytes()), first);
+
+    let mut fresh = Parser::new();
+    fresh.set_language(&get_language("c")).unwrap();
+    assert_eq!(callbacks(&mut fresh, source.as_bytes()), first);
+}
+
 #[test]
 fn test_parsing_with_timeout_when_error_detected() {
     let mut parser = Parser::new();
