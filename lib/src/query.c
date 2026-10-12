@@ -344,6 +344,8 @@ struct TSQueryCursor {
   uint32_t next_state_id;
   uint32_t next_finished_state_id;
   const TSQueryCursorOptions *query_options;
+  void *capture_payload;
+  TSQueryCapturePredicate capture_predicate;
   TSQueryCursorState query_state;
   unsigned operation_count;
   bool on_visible_node;
@@ -3556,6 +3558,8 @@ void ts_query_cursor_exec(
   array_clear(&self->exceeded_patterns);
   self->operation_count = 0;
   self->query_options = NULL;
+  self->capture_payload = NULL;
+  self->capture_predicate = NULL;
   self->query_state = (TSQueryCursorState) {0};
 }
 
@@ -3572,6 +3576,13 @@ void ts_query_cursor_exec_with_options(
       .payload = query_options->payload
     };
   }
+}
+
+void ts_query_cursor_set_capture_predicate(
+  TSQueryCursor *self, void *payload, TSQueryCapturePredicate predicate
+) {
+  self->capture_payload = payload;
+  self->capture_predicate = predicate;
 }
 
 bool ts_query_cursor_set_byte_range(
@@ -3680,12 +3691,16 @@ static bool ts_query_cursor__first_in_progress_capture(
       (node_start_byte == *byte_offset && state->pattern_index < *pattern_index)
     ) {
       QueryStep *step = array_get(&self->query->steps, state->step_index);
+      // A caller's capture predicate can reject a later step even when the
+      // structural query considers it guaranteed. Wait for a complete match.
+      bool guaranteed = step->root_pattern_guaranteed &&
+        !self->capture_predicate;
       if (is_definite) {
         // We're being a bit conservative here by asserting that the following step
         // is not immediate, because this capture might end up being discarded if the
         // following symbol in the tree isn't the required symbol for this step.
-        *is_definite = step->root_pattern_guaranteed && !step->is_immediate;
-      } else if (step->root_pattern_guaranteed) {
+        *is_definite = guaranteed && !step->is_immediate;
+      } else if (guaranteed) {
         continue;
       }
 
@@ -4354,6 +4369,23 @@ static inline bool ts_query_cursor__advance(
             }
           }
 
+          // A captured step always preserves a possible later-sibling
+          // alternative. Reject an impossible capture before allocating and
+          // copying that state: the sibling alternative is all that would
+          // survive rejection anyway. The ordinary immediate/last-child
+          // rules above still decide whether a later sibling is admissible.
+          if (node_does_match && self->capture_predicate) {
+            for (unsigned k = 0; k < MAX_STEP_CAPTURE_COUNT && step->capture_ids[k] != NONE; k++) {
+              if (!self->capture_predicate(
+                self->capture_payload, state->pattern_index,
+                step->capture_ids[k], node
+              )) {
+                node_does_match = false;
+                break;
+              }
+            }
+          }
+
           // Remove states immediately if it is ever clear that they cannot match.
           if (!node_does_match) {
             if (!later_sibling_can_match) {
@@ -4422,7 +4454,7 @@ static inline bool ts_query_cursor__advance(
           }
 
           // If the current node is captured in this pattern, add it to the capture list.
-          if (step->capture_ids[0] != NONE) {
+          if (!state->dead && step->capture_ids[0] != NONE) {
             ts_query_cursor__capture(self, state, step, node);
           }
 

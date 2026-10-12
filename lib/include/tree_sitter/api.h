@@ -1100,6 +1100,16 @@ void ts_query_cursor_exec_with_options(
 );
 
 /**
+ * Install an optional necessary condition on captured nodes for the current
+ * execution. Returning false discards that partial match. This is a pruning
+ * hint, not a replacement for checking predicates on complete matches.
+ * Call after exec; the next exec clears it. The payload must remain valid
+ * until iteration ends. Kept separate to preserve TSQueryCursorOptions' ABI.
+ */
+typedef bool (*TSQueryCapturePredicate)(void *payload, uint32_t pattern_index, uint32_t capture_id, TSNode node);
+void ts_query_cursor_set_capture_predicate(TSQueryCursor *self, void *payload, TSQueryCapturePredicate predicate);
+
+/**
  * Manage the maximum number of in-progress matches allowed by this query
  * cursor.
  *
