@@ -6754,3 +6754,77 @@ fn test_query_deep_clone_preserves_predicates_after_original_drop() {
     );
     assert_eq!(matches, &[(0, vec![("name", "foo")])]);
 }
+
+#[test]
+fn test_query_whole_subtree_ranges_exclude_zero_width_nodes_at_end() {
+    let language = get_language("javascript");
+    let query = Query::new(&language, "(_) @node (MISSING) @missing").unwrap();
+    let mut parser = Parser::new();
+    parser.set_language(&language).unwrap();
+    for source in [
+        "",
+        "foo(1",
+        "if (x { f(); }",
+        "let a = f(x);\nlet b = g(y);\n",
+    ] {
+        let tree = parser.parse(source, None).unwrap();
+        let mut roots = vec![tree.root_node()];
+        let mut index = 0;
+        while index < roots.len() {
+            let node = roots[index];
+            let mut cursor = node.walk();
+            roots.extend(node.children(&mut cursor));
+            index += 1;
+        }
+        for root in roots {
+            let collect = |cursor: &mut QueryCursor| {
+                let mut captures = Vec::new();
+                let mut matches = cursor.matches(&query, root, source.as_bytes());
+                while let Some(m) = matches.next() {
+                    for capture in m.captures() {
+                        captures.push((
+                            m.pattern_index,
+                            capture.index,
+                            capture.node.start_byte(),
+                            capture.node.end_byte(),
+                            capture.node.start_position(),
+                        ));
+                    }
+                }
+                captures
+            };
+            let unbounded = collect(&mut QueryCursor::new());
+            let mut cursor = QueryCursor::new();
+            cursor.set_byte_range(root.start_byte()..root.end_byte());
+            let expected: Vec<_> = unbounded
+                .iter()
+                .copied()
+                .filter(|capture| {
+                    // The API treats an end byte of zero as unbounded.
+                    root.end_byte() == 0 || capture.2 < root.end_byte()
+                })
+                .collect();
+            assert_eq!(
+                collect(&mut cursor),
+                expected,
+                "byte range: {source:?} / {root:?}"
+            );
+
+            let mut cursor = QueryCursor::new();
+            cursor.set_point_range(root.start_position()..root.end_position());
+            let expected: Vec<_> = unbounded
+                .iter()
+                .copied()
+                .filter(|capture| {
+                    // The point-range API has the same zero-end convention.
+                    root.end_position() == Point::new(0, 0) || capture.4 < root.end_position()
+                })
+                .collect();
+            assert_eq!(
+                collect(&mut cursor),
+                expected,
+                "point range: {source:?} / {root:?}"
+            );
+        }
+    }
+}
