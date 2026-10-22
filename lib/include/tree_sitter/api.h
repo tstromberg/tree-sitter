@@ -1109,6 +1109,12 @@ void ts_query_cursor_exec_with_options(
 typedef bool (*TSQueryCapturePredicate)(void *payload, uint32_t pattern_index, uint32_t capture_id, TSNode node);
 void ts_query_cursor_set_capture_predicate(TSQueryCursor *self, void *payload, TSQueryCapturePredicate predicate);
 
+/** Like the node-only capture predicate, with this candidate state's earlier
+ * captures. The borrowed capture array is valid only during the callback. */
+typedef bool (*TSQueryCaptureMatchPredicate)(void *payload, uint32_t pattern_index, uint32_t capture_id, TSNode node, const TSQueryCapture *captures, uint32_t capture_count);
+void ts_query_cursor_set_capture_match_predicate(TSQueryCursor *self, void *payload, TSQueryCaptureMatchPredicate predicate);
+
+
 /**
  * Manage the maximum number of in-progress matches allowed by this query
  * cursor.
@@ -1140,7 +1146,18 @@ uint32_t ts_query_cursor_max_states_per_group(const TSQueryCursor *self);
  * many patterns in one cursor keep the complete ones and re-run the rest.
  */
 bool ts_query_cursor_pattern_exceeded(const TSQueryCursor *self, uint32_t pattern_index);
+
+/** Stop one pattern in this cursor's current execution without mutating the
+ * shared query. Pending matches of that pattern are discarded. A subsequent
+ * call to ts_query_cursor_exec enables all patterns again. */
+void ts_query_cursor_disable_pattern(TSQueryCursor *self, uint32_t pattern_index);
 void ts_query_cursor_set_max_states_per_group(TSQueryCursor *self, uint32_t limit);
+
+/** Stop unfinished work for a pattern once any of its states is abandoned.
+ * Defaults to false. Completed matches remain valid and the pattern's exceeded
+ * flag stays set, allowing a batch caller to retry it independently. The option
+ * persists across executions; disabled patterns reset on each execution. */
+void ts_query_cursor_set_stop_on_pattern_limit(TSQueryCursor *self, bool enabled);
 
 /**
  * Set the range of bytes in which the query will be executed.

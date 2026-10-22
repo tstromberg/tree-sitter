@@ -248,11 +248,14 @@ impl<'a> ParseOptions<'a> {
 }
 
 pub type QueryCapturePredicate<'a> = &'a mut dyn FnMut(usize, u32, Node<'_>) -> bool;
+pub type QueryCaptureMatchPredicate<'a> =
+    &'a mut dyn FnMut(usize, u32, Node<'_>, &[QueryCapture<'_>]) -> bool;
 
 #[derive(Default)]
 pub struct QueryCursorOptions<'a> {
     pub progress_callback: Option<QueryProgressCallback<'a>>,
     pub capture_predicate: Option<QueryCapturePredicate<'a>>,
+    pub capture_match_predicate: Option<QueryCaptureMatchPredicate<'a>>,
 }
 
 impl<'a> QueryCursorOptions<'a> {
@@ -282,6 +285,18 @@ impl<'a> QueryCursorOptions<'a> {
         self
     }
 
+    /// Prune a candidate using its earlier captures as well as the current node.
+    /// The captures belong to this candidate, not other matches of the pattern.
+    /// The callback must reject only candidates no complete match could accept.
+    #[must_use]
+    pub fn capture_match_predicate<F: FnMut(usize, u32, Node<'_>, &[QueryCapture<'_>]) -> bool>(
+        mut self,
+        callback: &'a mut F,
+    ) -> Self {
+        self.capture_match_predicate = Some(callback);
+        self
+    }
+
     /// Create a new `QueryCursorOptions` with a shorter lifetime, borrowing from this one.
     ///
     /// This is useful when you need to reuse query cursor options multiple times, e.g., calling
@@ -290,6 +305,10 @@ impl<'a> QueryCursorOptions<'a> {
     pub fn reborrow(&mut self) -> QueryCursorOptions {
         QueryCursorOptions {
             capture_predicate: match &mut self.capture_predicate {
+                Some(cb) => Some(*cb),
+                None => None,
+            },
+            capture_match_predicate: match &mut self.capture_match_predicate {
                 Some(cb) => Some(*cb),
                 None => None,
             },
@@ -304,6 +323,7 @@ impl<'a> QueryCursorOptions<'a> {
 struct QueryCursorOptionsDrop<'options>(
     *mut ffi::TSQueryCursorOptions,
     *mut c_void,
+    *mut c_void,
     PhantomData<QueryProgressCallback<'options>>,
 );
 
@@ -317,6 +337,9 @@ impl Drop for QueryCursorOptionsDrop<'_> {
             }
             if !self.1.is_null() {
                 drop(Box::from_raw(self.1.cast::<QueryCapturePredicate>()));
+            }
+            if !self.2.is_null() {
+                drop(Box::from_raw(self.2.cast::<QueryCaptureMatchPredicate>()));
             }
             drop(Box::from_raw(self.0));
         }
@@ -3037,6 +3060,21 @@ impl Query {
         node: Node<'_>,
         source: &[u8],
     ) -> bool {
+        self.capture_satisfies_match_predicates(pattern, capture, node, &[], source)
+    }
+
+    /// Check necessary predicates using captures already bound by this state.
+    /// Cross-capture equality is safe to prune only when both captures occur
+    /// exactly once. Optional/repeated captures retain complete-match semantics.
+    #[must_use]
+    pub fn capture_satisfies_match_predicates(
+        &self,
+        pattern: usize,
+        capture: u32,
+        node: Node<'_>,
+        previous: &[QueryCapture<'_>],
+        source: &[u8],
+    ) -> bool {
         if self.capture_quantifiers[pattern].get(capture as usize) != Some(&CaptureQuantifier::One)
         {
             return true;
@@ -3047,6 +3085,21 @@ impl Query {
         self.text_predicates[pattern]
             .iter()
             .all(|predicate| match predicate {
+                TextPredicateCapture::EqCapture(a, b, positive, true)
+                    if *a == capture || *b == capture =>
+                {
+                    let other = if *a == capture { *b } else { *a };
+                    if self.capture_quantifiers[pattern].get(other as usize)
+                        != Some(&CaptureQuantifier::One)
+                    {
+                        return true;
+                    }
+                    previous
+                        .iter()
+                        .find(|c| c.index == other)
+                        .and_then(|c| source.get(c.node.byte_range()))
+                        .is_none_or(|other_text| (text == other_text) == *positive)
+                }
                 TextPredicateCapture::EqString(i, value, positive, true) if *i == capture => {
                     (text == value.as_bytes()) == *positive
                 }
@@ -3238,6 +3291,15 @@ impl QueryCursor {
         }
     }
 
+    /// Stop unfinished work for a pattern once it exceeds a state limit.
+    /// Defaults to false. Completed matches stay valid; `pattern_exceeded`
+    /// remains true so batch callers can retry the pattern independently.
+    /// This setting persists across executions; disabled patterns do not.
+    #[doc(alias = "ts_query_cursor_set_stop_on_pattern_limit")]
+    pub fn set_stop_on_pattern_limit(&mut self, enabled: bool) {
+        unsafe { ffi::ts_query_cursor_set_stop_on_pattern_limit(self.ptr.as_ptr(), enabled) }
+    }
+
     /// Get the current per-pattern-group state cap.
     #[doc(alias = "ts_query_cursor_max_states_per_group")]
     #[must_use]
@@ -3343,24 +3405,49 @@ impl QueryCursor {
                 callback(pattern as usize, capture, Node(node, PhantomData))
             }
         }
-        let query_options =
-            if options.progress_callback.is_some() || options.capture_predicate.is_some() {
-                let has_progress = options.progress_callback.is_some();
-                Some(QueryCursorOptionsDrop(
-                    Box::into_raw(Box::new(ffi::TSQueryCursorOptions {
-                        payload: options.progress_callback.map_or(ptr::null_mut(), |cb| {
-                            Box::into_raw(Box::new(cb)).cast::<c_void>()
-                        }),
-                        progress_callback: if has_progress { Some(progress) } else { None },
-                    })),
-                    options.capture_predicate.map_or(ptr::null_mut(), |cb| {
+        unsafe extern "C" fn capture_match_predicate(
+            payload: *mut c_void,
+            pattern: u32,
+            capture: u32,
+            node: ffi::TSNode,
+            captures: *const ffi::TSQueryCapture,
+            count: u32,
+        ) -> bool {
+            unsafe {
+                let callback = &mut *payload.cast::<QueryCaptureMatchPredicate>();
+                let captures = if count == 0 {
+                    &[]
+                } else {
+                    slice::from_raw_parts(captures.cast::<QueryCapture<'_>>(), count as usize)
+                };
+                callback(pattern as usize, capture, Node(node, PhantomData), captures)
+            }
+        }
+        let query_options = if options.progress_callback.is_some()
+            || options.capture_predicate.is_some()
+            || options.capture_match_predicate.is_some()
+        {
+            let has_progress = options.progress_callback.is_some();
+            Some(QueryCursorOptionsDrop(
+                Box::into_raw(Box::new(ffi::TSQueryCursorOptions {
+                    payload: options.progress_callback.map_or(ptr::null_mut(), |cb| {
                         Box::into_raw(Box::new(cb)).cast::<c_void>()
                     }),
-                    PhantomData,
-                ))
-            } else {
-                None
-            };
+                    progress_callback: if has_progress { Some(progress) } else { None },
+                })),
+                options.capture_predicate.map_or(ptr::null_mut(), |cb| {
+                    Box::into_raw(Box::new(cb)).cast::<c_void>()
+                }),
+                options
+                    .capture_match_predicate
+                    .map_or(ptr::null_mut(), |cb| {
+                        Box::into_raw(Box::new(cb)).cast::<c_void>()
+                    }),
+                PhantomData,
+            ))
+        } else {
+            None
+        };
 
         let ptr = self.ptr.as_ptr();
         unsafe {
@@ -3378,6 +3465,16 @@ impl QueryCursor {
                     None
                 } else {
                     Some(capture_predicate)
+                },
+            );
+            let match_payload = query_options.as_ref().map_or(ptr::null_mut(), |q| q.2);
+            ffi::ts_query_cursor_set_capture_match_predicate(
+                ptr,
+                match_payload,
+                if match_payload.is_null() {
+                    None
+                } else {
+                    Some(capture_match_predicate)
                 },
             );
         }
@@ -3468,24 +3565,49 @@ impl QueryCursor {
                 callback(pattern as usize, capture, Node(node, PhantomData))
             }
         }
-        let query_options =
-            if options.progress_callback.is_some() || options.capture_predicate.is_some() {
-                let has_progress = options.progress_callback.is_some();
-                Some(QueryCursorOptionsDrop(
-                    Box::into_raw(Box::new(ffi::TSQueryCursorOptions {
-                        payload: options.progress_callback.map_or(ptr::null_mut(), |cb| {
-                            Box::into_raw(Box::new(cb)).cast::<c_void>()
-                        }),
-                        progress_callback: if has_progress { Some(progress) } else { None },
-                    })),
-                    options.capture_predicate.map_or(ptr::null_mut(), |cb| {
+        unsafe extern "C" fn capture_match_predicate(
+            payload: *mut c_void,
+            pattern: u32,
+            capture: u32,
+            node: ffi::TSNode,
+            captures: *const ffi::TSQueryCapture,
+            count: u32,
+        ) -> bool {
+            unsafe {
+                let callback = &mut *payload.cast::<QueryCaptureMatchPredicate>();
+                let captures = if count == 0 {
+                    &[]
+                } else {
+                    slice::from_raw_parts(captures.cast::<QueryCapture<'_>>(), count as usize)
+                };
+                callback(pattern as usize, capture, Node(node, PhantomData), captures)
+            }
+        }
+        let query_options = if options.progress_callback.is_some()
+            || options.capture_predicate.is_some()
+            || options.capture_match_predicate.is_some()
+        {
+            let has_progress = options.progress_callback.is_some();
+            Some(QueryCursorOptionsDrop(
+                Box::into_raw(Box::new(ffi::TSQueryCursorOptions {
+                    payload: options.progress_callback.map_or(ptr::null_mut(), |cb| {
                         Box::into_raw(Box::new(cb)).cast::<c_void>()
                     }),
-                    PhantomData,
-                ))
-            } else {
-                None
-            };
+                    progress_callback: if has_progress { Some(progress) } else { None },
+                })),
+                options.capture_predicate.map_or(ptr::null_mut(), |cb| {
+                    Box::into_raw(Box::new(cb)).cast::<c_void>()
+                }),
+                options
+                    .capture_match_predicate
+                    .map_or(ptr::null_mut(), |cb| {
+                        Box::into_raw(Box::new(cb)).cast::<c_void>()
+                    }),
+                PhantomData,
+            ))
+        } else {
+            None
+        };
 
         let ptr = self.ptr.as_ptr();
         unsafe {
@@ -3503,6 +3625,16 @@ impl QueryCursor {
                     None
                 } else {
                     Some(capture_predicate)
+                },
+            );
+            let match_payload = query_options.as_ref().map_or(ptr::null_mut(), |q| q.2);
+            ffi::ts_query_cursor_set_capture_match_predicate(
+                ptr,
+                match_payload,
+                if match_payload.is_null() {
+                    None
+                } else {
+                    Some(capture_match_predicate)
                 },
             );
         }
@@ -3857,6 +3989,16 @@ impl<T: TextProvider<I>, I: AsRef<[u8]>> StreamingIteratorMut for QueryCaptures<
 }
 
 impl<T: TextProvider<I>, I: AsRef<[u8]>> QueryMatches<'_, '_, '_, T, I> {
+    /// Stop a pattern for the rest of this execution, discarding its pending
+    /// matches. Other patterns and the shared query are unaffected. Executing
+    /// the cursor again re-enables every pattern.
+    #[doc(alias = "ts_query_cursor_disable_pattern")]
+    pub fn disable_pattern(&mut self, pattern_index: usize) {
+        if let Ok(index) = u32::try_from(pattern_index) {
+            unsafe { ffi::ts_query_cursor_disable_pattern(self.ptr, index) };
+        }
+    }
+
     #[doc(alias = "ts_query_cursor_set_byte_range")]
     pub fn set_byte_range(&mut self, range: ops::Range<usize>) {
         unsafe {

@@ -367,17 +367,22 @@ struct TSQueryCursor {
   const TSQueryCursorOptions *query_options;
   void *capture_payload;
   TSQueryCapturePredicate capture_predicate;
+  void *capture_match_payload;
+  TSQueryCaptureMatchPredicate capture_match_predicate;
   TSQueryCursorState query_state;
   unsigned operation_count;
   bool on_visible_node;
   bool ascending;
   bool halted;
   bool did_exceed_match_limit;
+  bool stop_on_pattern_limit;
+  bool needs_pattern_prune;
   uint32_t max_states_per_group;
   // One flag per pattern: set when a state of that pattern was abandoned, so a
   // caller batching many patterns in one cursor can tell which results are
   // partial and re-run only those.
   Array(uint8_t) exceeded_patterns;
+  Array(uint8_t) disabled_patterns;
 };
 
 static const TSQueryError PARENT_DONE = -1;
@@ -3523,6 +3528,7 @@ TSQueryCursor *ts_query_cursor_new(void) {
     .did_exceed_match_limit = false,
     .max_states_per_group = DEFAULT_MAX_STATES_PER_GROUP,
     .exceeded_patterns = array_new(),
+    .disabled_patterns = array_new(),
     .ascending = false,
     .halted = false,
     .states = array_new(),
@@ -3554,6 +3560,7 @@ void ts_query_cursor_delete(TSQueryCursor *self) {
   ts_tree_cursor_delete(&self->cursor);
   capture_list_pool_delete(&self->capture_list_pool);
   array_delete(&self->exceeded_patterns);
+  array_delete(&self->disabled_patterns);
   ts_free(self);
 }
 
@@ -3567,6 +3574,27 @@ bool ts_query_cursor_pattern_exceeded(const TSQueryCursor *self, uint32_t patter
     *array_get(&self->exceeded_patterns, pattern_index);
 }
 
+void ts_query_cursor_disable_pattern(TSQueryCursor *self, uint32_t pattern_index) {
+  if (!self->query || pattern_index >= self->query->patterns.size) return;
+  while (self->disabled_patterns.size < self->query->patterns.size) {
+    array_push(&self->disabled_patterns, 0);
+  }
+  *array_get(&self->disabled_patterns, pattern_index) = 1;
+  QueryStateList *lists[] = {&self->states, &self->finished_states};
+  for (unsigned l = 0; l < 2; l++) {
+    QueryStateList *states = lists[l];
+    for (uint32_t i = states->size; i > 0; i--) {
+      QueryState *state = array_get(states, i - 1);
+      if (state->pattern_index == pattern_index) {
+        capture_list_pool_release(&self->capture_list_pool, state->capture_list_id);
+        array_erase(states, i - 1);
+      }
+    }
+  }
+  // The next read rebuilds the finished-state heap after these removals.
+  self->finished_states_heap_size = 0;
+}
+
 static void ts_query_cursor__mark_pattern_exceeded(TSQueryCursor *self, uint32_t pattern_index) {
   self->did_exceed_match_limit = true;
   if (!self->query) return;
@@ -3576,6 +3604,19 @@ static void ts_query_cursor__mark_pattern_exceeded(TSQueryCursor *self, uint32_t
     array_push(&self->exceeded_patterns, 0);
   }
   *array_get(&self->exceeded_patterns, pattern_index) = 1;
+  if (self->stop_on_pattern_limit) {
+    while (self->disabled_patterns.size < count) {
+      array_push(&self->disabled_patterns, 0);
+    }
+    *array_get(&self->disabled_patterns, pattern_index) = 1;
+    // Do not erase states while callers still hold pointers into the array.
+    // The next advance boundary releases them before processing another node.
+    self->needs_pattern_prune = true;
+  }
+}
+
+void ts_query_cursor_set_stop_on_pattern_limit(TSQueryCursor *self, bool enabled) {
+  self->stop_on_pattern_limit = enabled;
 }
 
 uint32_t ts_query_cursor_match_limit(const TSQueryCursor *self) {
@@ -3645,10 +3686,14 @@ void ts_query_cursor_exec(
   self->query = query;
   self->did_exceed_match_limit = false;
   array_clear(&self->exceeded_patterns);
+  array_clear(&self->disabled_patterns);
+  self->needs_pattern_prune = false;
   self->operation_count = 0;
   self->query_options = NULL;
   self->capture_payload = NULL;
   self->capture_predicate = NULL;
+  self->capture_match_payload = NULL;
+  self->capture_match_predicate = NULL;
   self->query_state = (TSQueryCursorState) {0};
 }
 
@@ -3673,6 +3718,14 @@ void ts_query_cursor_set_capture_predicate(
   self->capture_payload = payload;
   self->capture_predicate = predicate;
 }
+
+void ts_query_cursor_set_capture_match_predicate(
+  TSQueryCursor *self, void *payload, TSQueryCaptureMatchPredicate predicate
+) {
+  self->capture_match_payload = payload;
+  self->capture_match_predicate = predicate;
+}
+
 
 bool ts_query_cursor_set_byte_range(
   TSQueryCursor *self,
@@ -3783,7 +3836,7 @@ static bool ts_query_cursor__first_in_progress_capture(
       // A caller's capture predicate can reject a later step even when the
       // structural query considers it guaranteed. Wait for a complete match.
       bool guaranteed = step->root_pattern_guaranteed &&
-        !self->capture_predicate;
+        !self->capture_predicate && !self->capture_match_predicate;
       if (is_definite) {
         // We're being a bit conservative here by asserting that the following step
         // is not immediate, because this capture might end up being discarded if the
@@ -3919,6 +3972,8 @@ static void ts_query_cursor__add_state(
   TSQueryCursor *self,
   const PatternEntry *pattern
 ) {
+  if (pattern->pattern_index < self->disabled_patterns.size &&
+      *array_get(&self->disabled_patterns, pattern->pattern_index)) return;
   QueryStep *step = array_get(&self->query->steps, pattern->step_index);
   uint32_t start_depth = self->depth - step->depth;
 
@@ -4173,6 +4228,21 @@ static inline bool ts_query_cursor__advance(
 ) {
   bool did_match = false;
   for (;;) {
+    if (self->needs_pattern_prune) {
+      uint32_t kept = 0;
+      for (uint32_t i = 0; i < self->states.size; i++) {
+        QueryState *state = array_get(&self->states, i);
+        if (state->pattern_index < self->disabled_patterns.size &&
+            *array_get(&self->disabled_patterns, state->pattern_index)) {
+          capture_list_pool_release(&self->capture_list_pool, state->capture_list_id);
+        } else {
+          *array_get(&self->states, kept) = *state;
+          kept++;
+        }
+      }
+      self->states.size = kept;
+      self->needs_pattern_prune = false;
+    }
     if (self->halted) {
       while (self->states.size > 0) {
         QueryState state = array_pop(&self->states);
@@ -4463,12 +4533,18 @@ static inline bool ts_query_cursor__advance(
           // copying that state: the sibling alternative is all that would
           // survive rejection anyway. The ordinary immediate/last-child
           // rules above still decide whether a later sibling is admissible.
-          if (node_does_match && self->capture_predicate) {
+          if (node_does_match && (self->capture_predicate || self->capture_match_predicate)) {
+            const CaptureList *captures = self->capture_match_predicate
+              ? capture_list_pool_get(&self->capture_list_pool, state->capture_list_id)
+              : NULL;
             for (unsigned k = 0; k < MAX_STEP_CAPTURE_COUNT && step->capture_ids[k] != NONE; k++) {
-              if (!self->capture_predicate(
-                self->capture_payload, state->pattern_index,
-                step->capture_ids[k], node
-              )) {
+              if ((self->capture_predicate && !self->capture_predicate(
+                    self->capture_payload, state->pattern_index,
+                    step->capture_ids[k], node
+                  )) || (self->capture_match_predicate && !self->capture_match_predicate(
+                    self->capture_match_payload, state->pattern_index,
+                    step->capture_ids[k], node, captures->contents, captures->size
+                  ))) {
                 node_does_match = false;
                 break;
               }

@@ -9,6 +9,26 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 #[cfg(not(feature = "bindgen"))]
 include!("./bindings.rs");
 
+#[cfg(not(feature = "bindgen"))]
+unsafe extern "C" {
+    pub fn ts_query_cursor_set_stop_on_pattern_limit(cursor: *mut TSQueryCursor, enabled: bool);
+    pub fn ts_query_cursor_disable_pattern(cursor: *mut TSQueryCursor, pattern_index: u32);
+    pub fn ts_query_cursor_set_capture_match_predicate(
+        cursor: *mut TSQueryCursor,
+        payload: *mut core::ffi::c_void,
+        predicate: Option<
+            unsafe extern "C" fn(
+                *mut core::ffi::c_void,
+                u32,
+                u32,
+                TSNode,
+                *const TSQueryCapture,
+                u32,
+            ) -> bool,
+        >,
+    );
+}
+
 #[cfg(unix)]
 #[cfg(feature = "std")]
 unsafe extern "C" {
