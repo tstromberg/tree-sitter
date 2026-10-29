@@ -42,6 +42,7 @@ ifneq ($(findstring darwin,$(MACHINE)),)
 else ifneq ($(findstring mingw32,$(MACHINE)),)
 	SOEXT = dll
 	LINKSHARED += -s -shared -Wl,--out-implib,libtree-sitter.dll.a
+	DEF := lib/src/tree_sitter.def
 else
 	SOEXT = so
 	SOEXTVER_MAJOR = $(SOEXT).$(SONAME_MAJOR)
@@ -57,7 +58,7 @@ all: libtree-sitter.a libtree-sitter.$(SOEXT) tree-sitter.pc
 libtree-sitter.a: $(OBJ)
 	$(AR) $(ARFLAGS) $@ $^
 
-libtree-sitter.$(SOEXT): $(OBJ)
+libtree-sitter.$(SOEXT): $(OBJ) $(DEF)
 	$(CC) $(LDFLAGS) $(LINKSHARED) $^ $(LDLIBS) -o $@
 ifneq ($(STRIP),)
 	$(STRIP) $@
@@ -80,7 +81,7 @@ shared: libtree-sitter.$(SOEXT)
 static: libtree-sitter.a
 
 clean:
-	$(RM) $(OBJ) tree-sitter.pc libtree-sitter.a libtree-sitter.$(SOEXT) libtree-stitter.dll.a
+	$(RM) $(OBJ) tree-sitter.pc libtree-sitter.a libtree-sitter.$(SOEXT) libtree-sitter.dll.a
 
 install: all
 	install -d '$(DESTDIR)$(INCLUDEDIR)'/tree_sitter '$(DESTDIR)$(PCLIBDIR)' '$(DESTDIR)$(LIBDIR)'
@@ -111,6 +112,8 @@ uninstall:
 
 ##### Dev targets #####
 
+RUSTFMT_TOOLCHAIN ?= nightly
+
 test:
 	cargo xtask fetch-fixtures
 	cargo xtask generate-fixtures
@@ -122,8 +125,8 @@ test-wasm:
 
 lint:
 	cargo update --workspace --locked --quiet
-	cargo fmt --all --check
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo +$(RUSTFMT_TOOLCHAIN) fmt --all --check
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 lint-web:
 	npm --prefix lib/binding_web ci
@@ -134,7 +137,7 @@ lint-toml:
 	taplo format --check --diff
 
 format:
-	cargo fmt --all
+	cargo +$(RUSTFMT_TOOLCHAIN) fmt --all
 	taplo format
 
 changelog:
