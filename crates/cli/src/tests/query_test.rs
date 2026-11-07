@@ -5990,6 +5990,47 @@ fn test_query_max_start_depth_more() {
 }
 
 #[test]
+fn test_query_max_start_depth_patterns_sharing_a_symbol() {
+    // `(_ (call_expression ...))` is started at its first child, one level
+    // below its root, so it shares the `call_expression` pattern-map entries
+    // with a pattern rooted at `call_expression`. Each pattern's start depth
+    // must be its own: at the cursor's start node the child-started pattern
+    // cannot begin, but the rooted one must.
+    allocations::record(|| {
+        let language = get_language("javascript");
+        let source = "import(\"x\").then(f);";
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let query = Query::new(
+            &language,
+            r"
+            (_ (call_expression function: (import)) @inner) @parent
+            (call_expression function: (member_expression)) @outer
+            ",
+        )
+        .unwrap();
+        let outer = tree
+            .root_node()
+            .named_child(0)
+            .and_then(|statement| statement.named_child(0))
+            .unwrap();
+        assert_eq!(outer.kind(), "call_expression");
+
+        let mut cursor = QueryCursor::new();
+        for depth in [0, 1, 5] {
+            cursor.set_max_start_depth(Some(depth));
+            let matches = cursor.matches(&query, outer, source.as_bytes());
+            let found = collect_matches(matches, &query, source);
+            assert!(
+                found.contains(&(1, vec![("outer", "import(\"x\").then(f)")])),
+                "max_start_depth {depth}: {found:?}"
+            );
+        }
+    });
+}
+
+#[test]
 fn test_grammar_with_aliased_literal_query() {
     // module.exports = grammar({
     //   name: 'test',
