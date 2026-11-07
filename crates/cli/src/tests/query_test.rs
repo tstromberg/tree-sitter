@@ -4715,6 +4715,60 @@ fn test_query_disable_pattern() {
 }
 
 #[test]
+fn test_query_disable_wildcard_root_patterns() {
+    allocations::record(|| {
+        let language = get_language("javascript");
+        let source = "a + b;";
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let new_query = || {
+            Query::new(
+                &language,
+                r#"
+                    ((_) @first (#eq? @first "b"))
+                    ((_) @second (#eq? @second "a"))
+                    (identifier) @id
+                "#,
+            )
+            .unwrap()
+        };
+        let mut cursor = QueryCursor::new();
+
+        // One wildcard-rooted pattern disabled: the other still runs at every
+        // node, and the symbol-indexed pattern is still found.
+        let mut query = new_query();
+        query.disable_pattern(0);
+        assert_eq!(
+            collect_matches(
+                cursor.matches(&query, tree.root_node(), source.as_bytes()),
+                &query,
+                source
+            ),
+            &[
+                (1, vec![("second", "a")]),
+                (2, vec![("id", "a")]),
+                (2, vec![("id", "b")]),
+            ],
+        );
+
+        // Both disabled: the map holds fewer entries than there were
+        // wildcard-rooted patterns, and the search must stay inside it.
+        let mut query = new_query();
+        query.disable_pattern(0);
+        query.disable_pattern(1);
+        assert_eq!(
+            collect_matches(
+                cursor.matches(&query, tree.root_node(), source.as_bytes()),
+                &query,
+                source
+            ),
+            &[(2, vec![("id", "a")]), (2, vec![("id", "b")])],
+        );
+    });
+}
+
+#[test]
 fn test_query_deep_clone() {
     allocations::record(|| {
         let language = get_language("javascript");

@@ -3527,6 +3527,12 @@ void ts_query_disable_pattern(
   for (unsigned i = 0; i < self->pattern_map.size; i++) {
     PatternEntry *pattern = array_get(&self->pattern_map, i);
     if (pattern->pattern_index == pattern_index) {
+      // Wildcard-rooted entries lead the map, and the symbol search starts
+      // past them. Keep their count in step with the entries, or the search
+      // and the wildcard loop run past the end of a shrunken map.
+      if (i < self->wildcard_root_pattern_count) {
+        self->wildcard_root_pattern_count--;
+      }
       array_erase(&self->pattern_map, i);
       i--;
     }
