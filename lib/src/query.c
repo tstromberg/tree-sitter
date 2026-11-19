@@ -1856,6 +1856,12 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
   // one of the parent nodes, such that their children appear to belong to the
   // parent.
   AnalysisSubgraphArray subgraphs = array_new();
+  StatePredecessorMap predecessor_map = {0};
+  Array(AnalysisSubgraphNode) next_nodes = array_new();
+  QueryAnalysis analysis = query_analysis__new();
+  if (!parent_step_indices.size && !non_rooted_pattern_start_steps.size) {
+    goto analyze_predicates;
+  }
   for (unsigned i = 0; i < parent_step_indices.size; i++) {
     uint32_t parent_step_index = *array_get(&parent_step_indices, i);
     TSSymbol parent_symbol = array_get(&self->steps, parent_step_index)->symbol;
@@ -1875,7 +1881,7 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
   //   2) All of the parse states where one of these symbols can end, along
   //      with information about the node that would be created.
   //   3) A list of predecessor states for each state.
-  StatePredecessorMap predecessor_map = state_predecessor_map_new(self->language);
+  predecessor_map = state_predecessor_map_new(self->language);
   for (TSStateId state = 1; state < (uint16_t)self->language->state_count; state++) {
     unsigned subgraph_index, exists;
     LookaheadIterator lookahead_iterator = ts_language_lookaheads(self->language, state);
@@ -1952,7 +1958,6 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
 
   // For each subgraph, compute the preceding states by walking backward
   // from the end states using the predecessor map.
-  Array(AnalysisSubgraphNode) next_nodes = array_new();
   for (unsigned i = 0; i < subgraphs.size; i++) {
     AnalysisSubgraph *subgraph = array_get(&subgraphs, i);
     if (subgraph->nodes.size == 0) {
@@ -2016,7 +2021,6 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
 
   // For each non-terminal pattern, determine if the pattern can successfully match,
   // and identify all of the possible children within the pattern where matching could fail.
-  QueryAnalysis analysis = query_analysis__new();
   for (unsigned i = 0; i < parent_step_indices.size; i++) {
     uint16_t parent_step_index = *array_get(&parent_step_indices, i);
     uint16_t parent_depth = array_get(&self->steps, parent_step_index)->depth;
@@ -2121,6 +2125,7 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
     }
   }
 
+analyze_predicates:;
   // Mark as indefinite any step with captures that are used in predicates.
   Array(uint16_t) predicate_capture_ids = array_new();
   for (unsigned i = 0; i < self->patterns.size; i++) {

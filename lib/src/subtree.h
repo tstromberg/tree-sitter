@@ -31,7 +31,7 @@ extern "C" {
 typedef struct {
   union {
     char *long_data;
-    char short_data[24];
+    char short_data[16];
   };
   uint32_t length;
 } ExternalScannerState;
