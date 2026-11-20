@@ -3139,10 +3139,117 @@ static TSQueryError ts_query__parse_pattern(
   return 0;
 }
 
+// What `ts_query__analyze_patterns` concludes about a query, as
+// `ts_query_analysis` writes it: this header, one byte of flags per step, one
+// byte per pattern, then the repeat symbols with rootless patterns. In host
+// byte order: it is a cache of work done on this machine, not an interchange
+// format.
+typedef struct {
+  uint32_t magic;
+  uint32_t state_count;
+  uint32_t symbol_count;
+  uint32_t step_count;
+  uint32_t pattern_count;
+  uint32_t repeat_symbol_count;
+} QueryAnalysisHeader;
+
+#define QUERY_ANALYSIS_MAGIC 0x31415154u // "TQA1"
+#define STEP_CONTAINS_CAPTURES 1u
+#define STEP_ROOT_PATTERN_GUARANTEED 2u
+#define STEP_PARENT_PATTERN_GUARANTEED 4u
+
+uint32_t ts_query_analysis(const TSQuery *self, uint8_t *buffer, uint32_t capacity) {
+  QueryAnalysisHeader header = {
+    .magic = QUERY_ANALYSIS_MAGIC,
+    .state_count = self->language->state_count,
+    .symbol_count = self->language->symbol_count,
+    .step_count = self->steps.size,
+    .pattern_count = self->patterns.size,
+    .repeat_symbol_count = self->repeat_symbols_with_rootless_patterns.size,
+  };
+  uint64_t length = sizeof(header) + (uint64_t)header.step_count + header.pattern_count +
+    (uint64_t)header.repeat_symbol_count * sizeof(TSSymbol);
+  if (length > UINT32_MAX) return 0;
+  if (length > capacity) return (uint32_t)length;
+
+  memcpy(buffer, &header, sizeof(header));
+  uint8_t *out = buffer + sizeof(header);
+  for (unsigned i = 0; i < self->steps.size; i++) {
+    const QueryStep *step = array_get(&self->steps, i);
+    *out++ = (uint8_t)(
+      (step->contains_captures ? STEP_CONTAINS_CAPTURES : 0) |
+      (step->root_pattern_guaranteed ? STEP_ROOT_PATTERN_GUARANTEED : 0) |
+      (step->parent_pattern_guaranteed ? STEP_PARENT_PATTERN_GUARANTEED : 0)
+    );
+  }
+  for (unsigned i = 0; i < self->patterns.size; i++) {
+    *out++ = array_get(&self->patterns, i)->is_non_local;
+  }
+  if (header.repeat_symbol_count > 0) {
+    memcpy(
+      out,
+      self->repeat_symbols_with_rootless_patterns.contents,
+      header.repeat_symbol_count * sizeof(TSSymbol)
+    );
+  }
+  return (uint32_t)length;
+}
+
+// Take the place of `ts_query__analyze_patterns` with the analysis of an
+// earlier query of this language and source. Returns false, changing nothing,
+// when the analysis is not one this query's steps and patterns could have
+// produced.
+static bool ts_query__apply_analysis(TSQuery *self, const uint8_t *analysis, uint32_t length) {
+  QueryAnalysisHeader header;
+  if (!analysis || length < sizeof(header)) return false;
+  memcpy(&header, analysis, sizeof(header));
+  if (
+    header.magic != QUERY_ANALYSIS_MAGIC ||
+    header.state_count != self->language->state_count ||
+    header.symbol_count != self->language->symbol_count ||
+    header.step_count != self->steps.size ||
+    header.pattern_count != self->patterns.size ||
+    length != sizeof(header) + (uint64_t)header.step_count + header.pattern_count +
+      (uint64_t)header.repeat_symbol_count * sizeof(TSSymbol)
+  ) return false;
+
+  const uint8_t *in = analysis + sizeof(header);
+  for (unsigned i = 0; i < self->steps.size; i++) {
+    QueryStep *step = array_get(&self->steps, i);
+    uint8_t flags = *in++;
+    step->contains_captures = (flags & STEP_CONTAINS_CAPTURES) != 0;
+    step->root_pattern_guaranteed = (flags & STEP_ROOT_PATTERN_GUARANTEED) != 0;
+    step->parent_pattern_guaranteed = (flags & STEP_PARENT_PATTERN_GUARANTEED) != 0;
+  }
+  for (unsigned i = 0; i < self->patterns.size; i++) {
+    array_get(&self->patterns, i)->is_non_local = *in++ != 0;
+  }
+  for (uint32_t i = 0; i < header.repeat_symbol_count; i++) {
+    TSSymbol symbol;
+    memcpy(&symbol, in + i * sizeof(TSSymbol), sizeof(TSSymbol));
+    array_push(&self->repeat_symbols_with_rootless_patterns, symbol);
+  }
+  return true;
+}
+
 TSQuery *ts_query_new(
   const TSLanguage *language,
   const char *source,
   uint32_t source_len,
+  uint32_t *error_offset,
+  TSQueryError *error_type
+) {
+  return ts_query_new_with_analysis(
+    language, source, source_len, NULL, 0, error_offset, error_type
+  );
+}
+
+TSQuery *ts_query_new_with_analysis(
+  const TSLanguage *language,
+  const char *source,
+  uint32_t source_len,
+  const uint8_t *analysis,
+  uint32_t analysis_len,
   uint32_t *error_offset,
   TSQueryError *error_type
 ) {
@@ -3315,7 +3422,10 @@ TSQuery *ts_query_new(
     ts_query__dump_steps(self, "post-parse");
   #endif
 
-  if (!ts_query__analyze_patterns(self, error_offset)) {
+  if (
+    !ts_query__apply_analysis(self, analysis, analysis_len) &&
+    !ts_query__analyze_patterns(self, error_offset)
+  ) {
     *error_type = TSQueryErrorStructure;
     ts_query_delete(self);
     return NULL;

@@ -608,6 +608,22 @@ unsafe extern "C" {
     ) -> *mut TSQuery;
 }
 unsafe extern "C" {
+    #[doc = " Create a query as [`ts_query_new`] does, reusing the pattern analysis that\n [`ts_query_analysis`] wrote for an earlier query of the same language and\n source. Analysis is most of the cost of creating a query, and its result\n depends only on those two.\n\n Analysis that this query's patterns could not have produced is ignored and\n computed afresh, so a stale or damaged buffer costs time, not correctness.\n A buffer written for a different source that happens to have the same shape\n is not detected: the caller must key what it stores by language and source."]
+    pub fn ts_query_new_with_analysis(
+        language: *const TSLanguage,
+        source: *const ::core::ffi::c_char,
+        source_len: u32,
+        analysis: *const u8,
+        analysis_len: u32,
+        error_offset: *mut u32,
+        error_type: *mut TSQueryError,
+    ) -> *mut TSQuery;
+}
+unsafe extern "C" {
+    #[doc = " Write the query's pattern analysis to `buffer`, for a later\n [`ts_query_new_with_analysis`], and return its length in bytes. Nothing is\n written when the analysis does not fit in `capacity`; call with a capacity\n of zero to learn the length. The bytes are in host byte order."]
+    pub fn ts_query_analysis(self_: *const TSQuery, buffer: *mut u8, capacity: u32) -> u32;
+}
+unsafe extern "C" {
     #[doc = " Delete a query, freeing all of the memory that it used."]
     pub fn ts_query_delete(self_: *mut TSQuery);
 }

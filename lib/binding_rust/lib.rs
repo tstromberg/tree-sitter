@@ -2540,8 +2540,35 @@ impl Query {
     /// on syntax nodes parsed with that language. References to Queries can be
     /// shared between multiple threads.
     pub fn new(language: &Language, source: &str) -> Result<Self, QueryError> {
-        let ptr = Self::new_raw(language, source)?;
+        Self::with_analysis(language, source, &[])
+    }
+
+    /// Create a query as [`new`](Query::new) does, reusing the pattern analysis
+    /// [`analysis`](Query::analysis) returned for an earlier query of the same
+    /// language and source. Analysis is most of the cost of creating a query.
+    ///
+    /// Analysis this query's patterns could not have produced is ignored and
+    /// computed afresh. Analysis of a different source with the same shape is
+    /// not detected: key what you store by language and source.
+    pub fn with_analysis(
+        language: &Language,
+        source: &str,
+        analysis: &[u8],
+    ) -> Result<Self, QueryError> {
+        let ptr = Self::compile(language, source, analysis)?;
         unsafe { Self::from_raw_parts(ptr, source) }
+    }
+
+    /// The query's pattern analysis, for a later
+    /// [`with_analysis`](Query::with_analysis). Valid for this language and
+    /// source on this machine.
+    #[must_use]
+    pub fn analysis(&self) -> Vec<u8> {
+        let ptr = self.ptr.as_ptr();
+        let len = unsafe { ffi::ts_query_analysis(ptr, core::ptr::null_mut(), 0) };
+        let mut analysis = vec![0u8; len as usize];
+        unsafe { ffi::ts_query_analysis(ptr, analysis.as_mut_ptr(), len) };
+        analysis
     }
 
     /// Constructs a raw [`TSQuery`](ffi::TSQuery) pointer without performing extra checks specific
@@ -2550,16 +2577,26 @@ impl Query {
     /// The caller is responsible for ensuring that the returned pointer is eventually freed by
     /// calling [`ts_query_delete`](ffi::ts_query_delete).
     pub fn new_raw(language: &Language, source: &str) -> Result<*mut ffi::TSQuery, QueryError> {
+        Self::compile(language, source, &[])
+    }
+
+    fn compile(
+        language: &Language,
+        source: &str,
+        analysis: &[u8],
+    ) -> Result<*mut ffi::TSQuery, QueryError> {
         let mut error_offset = 0u32;
         let mut error_type: ffi::TSQueryError = 0;
         let bytes = source.as_bytes();
 
         // Compile the query.
         let ptr = unsafe {
-            ffi::ts_query_new(
+            ffi::ts_query_new_with_analysis(
                 language.0,
                 bytes.as_ptr().cast::<c_char>(),
                 bytes.len() as u32,
+                analysis.as_ptr(),
+                analysis.len() as u32,
                 core::ptr::addr_of_mut!(error_offset),
                 core::ptr::addr_of_mut!(error_type),
             )

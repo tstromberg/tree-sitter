@@ -936,6 +936,35 @@ TSQuery *ts_query_new(
 );
 
 /**
+ * Create a query as [`ts_query_new`] does, reusing the pattern analysis that
+ * [`ts_query_analysis`] wrote for an earlier query of the same language and
+ * source. Analysis is most of the cost of creating a query, and its result
+ * depends only on those two.
+ *
+ * Analysis that this query's patterns could not have produced is ignored and
+ * computed afresh, so a stale or damaged buffer costs time, not correctness.
+ * A buffer written for a different source that happens to have the same shape
+ * is not detected: the caller must key what it stores by language and source.
+ */
+TSQuery *ts_query_new_with_analysis(
+  const TSLanguage *language,
+  const char *source,
+  uint32_t source_len,
+  const uint8_t *analysis,
+  uint32_t analysis_len,
+  uint32_t *error_offset,
+  TSQueryError *error_type
+);
+
+/**
+ * Write the query's pattern analysis to `buffer`, for a later
+ * [`ts_query_new_with_analysis`], and return its length in bytes. Nothing is
+ * written when the analysis does not fit in `capacity`; call with a capacity
+ * of zero to learn the length. The bytes are in host byte order.
+ */
+uint32_t ts_query_analysis(const TSQuery *self, uint8_t *buffer, uint32_t capacity);
+
+/**
  * Delete a query, freeing all of the memory that it used.
  */
 void ts_query_delete(TSQuery *self);

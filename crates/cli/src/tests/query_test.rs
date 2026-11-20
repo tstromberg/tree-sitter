@@ -7194,3 +7194,45 @@ fn test_query_whole_subtree_ranges_exclude_zero_width_nodes_at_end() {
         }
     }
 }
+
+#[test]
+fn test_query_with_saved_analysis() {
+    let language = get_language("javascript");
+    let source = r"
+        (call_expression function: (identifier) @fn arguments: (arguments (string) @arg))
+        ((comment)* @doc . (function_declaration name: (identifier) @name))
+        (_ (identifier) @id)
+    ";
+    let analyzed = Query::new(&language, source).unwrap();
+    let analysis = analyzed.analysis();
+    assert!(!analysis.is_empty());
+
+    let restored = Query::with_analysis(&language, source, &analysis).unwrap();
+    assert_eq!(restored.analysis(), analysis);
+    for pattern in 0..analyzed.pattern_count() {
+        assert_eq!(
+            restored.is_pattern_rooted(pattern),
+            analyzed.is_pattern_rooted(pattern)
+        );
+        assert_eq!(
+            restored.is_pattern_non_local(pattern),
+            analyzed.is_pattern_non_local(pattern)
+        );
+        for offset in
+            analyzed.start_byte_for_pattern(pattern)..analyzed.end_byte_for_pattern(pattern)
+        {
+            assert_eq!(
+                restored.is_pattern_guaranteed_at_step(offset),
+                analyzed.is_pattern_guaranteed_at_step(offset),
+                "pattern {pattern}, offset {offset}"
+            );
+        }
+    }
+
+    // An analysis that does not fit the query is ignored, never trusted.
+    let other = Query::new(&language, "(identifier) @id").unwrap().analysis();
+    for unfit in [&other[..], &analysis[..analysis.len() - 1], &[0xff; 24][..]] {
+        let fallback = Query::with_analysis(&language, source, unfit).unwrap();
+        assert_eq!(fallback.analysis(), analysis);
+    }
+}
