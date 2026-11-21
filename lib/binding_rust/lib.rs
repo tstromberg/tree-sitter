@@ -11,7 +11,9 @@ mod util;
 ))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, format, string::String, string::ToString, vec::Vec};
+use alloc::{boxed::Box, format, string::String, string::ToString, sync::Arc, vec::Vec};
+#[cfg(feature = "std")]
+use std::sync::Arc;
 use core::{
     ffi::{CStr, c_char, c_void},
     fmt::{self, Write},
@@ -393,11 +395,13 @@ pub struct TreeCursor<'tree>(ffi::TSTreeCursor, PhantomData<&'tree ()>);
 pub struct Query {
     ptr: NonNull<ffi::TSQuery>,
     capture_names: Box<[&'static str]>,
-    capture_quantifiers: Box<[Box<[CaptureQuantifier]>]>,
-    text_predicates: Box<[Box<[TextPredicateCapture]>]>,
-    property_settings: Box<[Box<[QueryProperty]>]>,
-    property_predicates: Box<[Box<[(QueryProperty, bool)]>]>,
-    general_predicates: Box<[Box<[QueryPredicate]>]>,
+    // Fixed once the query is compiled, so a copy (see `deep_clone`) shares
+    // them: disabling a pattern or a capture changes only the native query.
+    capture_quantifiers: Arc<[Box<[CaptureQuantifier]>]>,
+    text_predicates: Arc<[Box<[TextPredicateCapture]>]>,
+    property_settings: Arc<[Box<[QueryProperty]>]>,
+    property_predicates: Arc<[Box<[(QueryProperty, bool)]>]>,
+    general_predicates: Arc<[Box<[QueryPredicate]>]>,
 }
 
 /// A quantifier for captures
@@ -3036,7 +3040,7 @@ impl Query {
 
     /// Get the quantifiers of the captures used in the query.
     #[must_use]
-    pub const fn capture_quantifiers(&self, index: usize) -> &[CaptureQuantifier] {
+    pub fn capture_quantifiers(&self, index: usize) -> &[CaptureQuantifier] {
         &self.capture_quantifiers[index]
     }
 
@@ -3053,7 +3057,7 @@ impl Query {
     ///
     /// This includes predicates with the operators `is?` and `is-not?`.
     #[must_use]
-    pub const fn property_predicates(&self, index: usize) -> &[(QueryProperty, bool)] {
+    pub fn property_predicates(&self, index: usize) -> &[(QueryProperty, bool)] {
         &self.property_predicates[index]
     }
 
@@ -3061,7 +3065,7 @@ impl Query {
     ///
     /// This includes predicates with the operator `set!`.
     #[must_use]
-    pub const fn property_settings(&self, index: usize) -> &[QueryProperty] {
+    pub fn property_settings(&self, index: usize) -> &[QueryProperty] {
         &self.property_settings[index]
     }
 
@@ -3073,7 +3077,7 @@ impl Query {
     /// * `is?` and `is-not?`
     /// * `set!`
     #[must_use]
-    pub const fn general_predicates(&self, index: usize) -> &[QueryPredicate] {
+    pub fn general_predicates(&self, index: usize) -> &[QueryPredicate] {
         &self.general_predicates[index]
     }
 
@@ -3174,16 +3178,18 @@ impl Query {
     #[doc(alias = "ts_query_copy")]
     #[must_use]
     pub fn deep_clone(&self) -> Self {
-        // Clone the already compiled predicates instead of parsing them again
-        // and recompiling every regex for each file-specific query copy.
+        // Share the already compiled predicates instead of parsing them again
+        // and recompiling every regex, or copying them, for each
+        // file-specific query copy: for a bank of hundreds of patterns they
+        // are most of what a copy would hold.
         let mut result = Self {
             ptr: unsafe { NonNull::new_unchecked(ffi::ts_query_copy(self.ptr.as_ptr())) },
             capture_names: Box::default(),
-            capture_quantifiers: self.capture_quantifiers.clone(),
-            text_predicates: self.text_predicates.clone(),
-            property_settings: self.property_settings.clone(),
-            property_predicates: self.property_predicates.clone(),
-            general_predicates: self.general_predicates.clone(),
+            capture_quantifiers: Arc::clone(&self.capture_quantifiers),
+            text_predicates: Arc::clone(&self.text_predicates),
+            property_settings: Arc::clone(&self.property_settings),
+            property_predicates: Arc::clone(&self.property_predicates),
+            general_predicates: Arc::clone(&self.general_predicates),
         };
         // Names borrow the native query's storage. Rebind them to the copy so
         // dropping the original cannot leave the copy with dangling names.
